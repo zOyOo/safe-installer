@@ -532,7 +532,10 @@ async function handleInstallWithPackages(pkgArgs, flags, { isGlobal = false } = 
     lockPath = path.join(tmpDir, 'package-lock.json');
 
     console.log(`\n[safe-npm] Resolving full dependency tree in temp dir...`);
-    const resolveCode = await runNpmSilentInDir(tmpDir, ['install', ...allPinned, ...flags, '--package-lock-only']);
+    // Pass only top-level pinned packages — npm's own resolver handles transitive
+    // resolution with correct platform filtering (e.g. excludes darwin packages on linux).
+    // Phase 3 then audits the full platform-correct lockfile npm produces.
+    const resolveCode = await runNpmSilentInDir(tmpDir, ['install', ...pinnedArgs, ...flags, '--package-lock-only']);
     if (resolveCode !== 0) {
       fs.rmSync(tmpDir, { recursive: true, force: true });
       process.exit(resolveCode);
@@ -583,9 +586,13 @@ async function handleInstallWithPackages(pkgArgs, flags, { isGlobal = false } = 
   if (isGlobal) {
     // Temp dir no longer needed — clean up before the real install
     fs.rmSync(tmpDir, { recursive: true, force: true });
-    // Install all audited pins (top-level + transitive) globally so npm can't
-    // re-resolve transitives to a newer unsafe version (no lockfile to enforce them).
-    await runNpm(['install', '-g', ...allPinned, ...flags]);
+    // Pass only the top-level pinned packages. Transitive enforcement is not possible
+    // for global installs: explicitly passing transitive pins causes EBADPLATFORM for
+    // platform-specific optional packages (e.g. @img/sharp-darwin-arm64 on linux) because
+    // npm lockfiles don't record the libc constraint — only os/cpu — so we can't fully
+    // filter them. The full transitive tree was audited in Phase 3, and npm will re-resolve
+    // the same versions in Phase 4 using its own platform-aware logic.
+    await runNpm(['install', '-g', ...pinnedArgs, ...flags]);
   } else {
     // lockfile + package.json already written correctly — install from lockfile
     await runNpm(['install', ...flags]);

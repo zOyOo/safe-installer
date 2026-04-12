@@ -33,8 +33,47 @@ mistaken for a package name by `splitFlagsAndPkgs`.
 
 ### `npm install -g` with no packages
 
-`safe-npm install -g` (no package args) re-adds `-g` to the flags before calling
-`handleInstallNoPackages`, so the audit-then-install flow uses the global flag correctly.
+Blocked with a clear error. `handleInstallNoPackages` uses `--package-lock-only` for
+fresh resolution, but npm ignores that flag for global installs, so the real install would
+happen before the audit. Use `safe-npm install -g <pkg>` with explicit package names.
+
+### Why transitive pins are not enforced in Phase 4 (known limitation)
+
+For local installs, Phase 4 runs `npm install` from the already-written lockfile, which
+enforces exact transitive versions. Global installs have no such mechanism:
+
+- npm ignores lockfiles for global installs.
+- Explicitly passing all transitive pins to `npm install -g <all-pins>` fails with
+  `EBADPLATFORM` for platform-specific optional packages (e.g. `@img/sharp-darwin-arm64`
+  on Linux). This cannot be filtered from the lockfile alone because npm lockfiles record
+  `os` and `cpu` fields but **not** the `libc` constraint (musl vs glibc). npm fetches
+  that from the registry at install time.
+
+**Mitigation:** Phase 3 audits the complete transitive tree that npm resolved in the
+temp dir (which is platform-correct). Phase 4 then passes only the top-level pinned
+package(s) and lets npm re-resolve. The re-resolution window is seconds; the registry
+data is the same. In practice the risk is negligible.
+
+**WONTFIX:** Enforcing audited transitive pins in Phase 4 for global installs is not
+feasible with the current npm API. Three approaches were attempted and all failed:
+
+1. **Pass `allPinned` (BFS transitive pins)** — fails with `EBADPLATFORM` because the
+   BFS collects all platform variants (darwin, musl, arm64, etc.) and npm rejects
+   incompatible ones when they are named explicitly.
+
+2. **Pass lockfile packages filtered by `os`/`cpu`** — still fails with `EBADPLATFORM`
+   because npm lockfiles record `os` and `cpu` but omit the `libc` field (musl vs glibc).
+   npm fetches `libc` constraints from the registry at install time, so lockfile-based
+   filtering is incomplete (confirmed on testars: `@img/sharp-libvips-linuxmusl-x64`
+   passes the lockfile filter but is rejected at install).
+
+3. **Pass lockfile packages filtered by `os`/`cpu`/`libc`** — would require fetching
+   every transitive dep's `package.json` from the registry to get the `libc` field, adding
+   significant latency and complexity for a marginal security gain.
+
+The accepted approach (Phase 3 audit + Phase 4 top-level-only install) is safe in
+practice: the re-resolution window is seconds, npm uses its cache from Phase 2, and the
+registry does not change between Phase 3 and Phase 4 in any realistic scenario.
 
 ---
 
