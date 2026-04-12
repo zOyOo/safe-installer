@@ -1,0 +1,11 @@
+# Node
+safe-npm/node_modules/
+safe-npm/package-lock.json
+
+# Python
+safe-pip/__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store

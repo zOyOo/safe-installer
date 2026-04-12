@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""safe-pip: only install packages published >30 days ago (supply-chain protection)."""
+from __future__ import annotations
+import sys
+import os
+
+# Force unbuffered stdout so our prints interleave correctly with subprocess stderr
+sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # line-buffered
+import json
+import subprocess
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+SAFE_AGE_DAYS = int(os.environ.get('SAFE_PIP_AGE_DAYS', '30'))
+CUTOFF = datetime.now(timezone.utc) - timedelta(days=SAFE_AGE_DAYS)
+
+try:
+    from packaging.version import Version, InvalidVersion
+    from packaging.specifiers import SpecifierSet
+    from packaging.requirements import Requirement
+    from packaging.markers import default_environment
+except ImportError:
+    # Fall back to pip's bundled copy (always available)
+    from pip._vendor.packaging.version import Version, InvalidVersion
+    from pip._vendor.packaging.specifiers import SpecifierSet
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.markers import default_environment
+
+# ─── PyPI API ─────────────────────────────────────────────────────────────────
+
+def fetch_pypi(package: str) -> dict:
+    url = f"https://pypi.org/pypi/{package}/json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "safe-pip/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ValueError(f'Package "{package}" not found on PyPI')
+        raise RuntimeError(f'PyPI returned HTTP {e.code} for "{package}"')
+    except Exception as e:
+        raise RuntimeError(f'Failed to fetch "{package}" from PyPI: {e}')
+
+
+def release_date(files: list) -> datetime | None:
+    """Earliest upload time across all distribution files in a release."""
+    times = []
+    for f in files:
+        t = f.get("upload_time_iso_8601") or f.get("upload_time")
+        if t:
+            t = t.replace("Z", "+00:00")
+            if "+" not in t and not t.endswith("Z"):
+                t += "+00:00"
+            try:
+                times.append(datetime.fromisoformat(t))
+            except ValueError:
+                pass
+    return min(times) if times else None
+
+
+_CURRENT_PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+
+
+def get_installed_version(name: str) -> str | None:
+    """Return the installed version of a package, or None if not installed."""
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        return version(name)
+    except Exception:
+        return None
+
+def is_python_compatible(files: list) -> bool:
+    """Return True if any distribution file supports the running Python version."""
+    for f in files:
+        req = f.get("requires_python")
+        if req is None:
+            return True  # no restriction → compatible
+        try:
+            if _CURRENT_PYTHON in SpecifierSet(req):
+                return True
+        except Exception:
+            return True  # unparseable → assume compatible
+    return False
+
+
+# ─── Version resolution ───────────────────────────────────────────────────────
+
+def find_safe_version(info: dict, specifier: str = "") -> tuple[str | None, datetime | None]:
+    """Latest stable version satisfying `specifier` published before CUTOFF."""
+    spec = SpecifierSet(specifier, prereleases=False)
+    candidates = []
+
+    for ver_str, files in info.get("releases", {}).items():
+        if not files:
+            continue
+        try:
+            ver = Version(ver_str)
+        except InvalidVersion:
+            continue
+        if ver.is_prerelease or ver.is_devrelease:
+            continue
+        if not is_python_compatible(files):
+            continue
+        if specifier and ver not in spec:
+            continue
+        pub = release_date(files)
+        if pub and pub < CUTOFF:
+            candidates.append((ver, pub, ver_str))
+
+    if not candidates:
+        return None, None
+    best = max(candidates, key=lambda x: x[0])
+    return best[2], best[1]
+
+
+def get_skipped(info: dict, safe_ver_str: str, specifier: str = "") -> list[tuple]:
+    """All stable versions newer than safe_ver_str, tagged with skip reason.
+
+    Returns list of (ver_str, date, age_days, too_new: bool, py_compat: bool).
+    - too_new=True: published within SAFE_AGE_DAYS (primary skip reason)
+    - py_compat=False: incompatible with the running Python (secondary reason)
+    """
+    spec = SpecifierSet(specifier, prereleases=False)
+    safe_ver = Version(safe_ver_str)
+    skipped = []
+
+    for ver_str, files in info.get("releases", {}).items():
+        if not files:
+            continue
+        try:
+            ver = Version(ver_str)
+        except InvalidVersion:
+            continue
+        if ver.is_prerelease or ver.is_devrelease:
+            continue
+        if specifier and ver not in spec:
+            continue
+        if ver <= safe_ver:
+            continue
+        pub = release_date(files)
+        if pub:
+            age = (datetime.now(timezone.utc) - pub).days
+            too_new = pub >= CUTOFF
+            py_ok = is_python_compatible(files)
+            skipped.append((ver, ver_str, pub.strftime("%Y-%m-%d"), age, too_new, py_ok))
+
+    skipped.sort(key=lambda x: x[0])
+    return [(s[1], s[2], s[3], s[4], s[5]) for s in skipped]
+
+
+def _print_skipped(skipped: list, indent: str = "     ") -> None:
+    """Print skipped versions grouped by reason."""
+    too_new    = [(v, d, a) for v, d, a, is_new, py_ok in skipped if is_new]
+    py_incompat = [(v, d, a) for v, d, a, is_new, py_ok in skipped if not is_new and not py_ok]
+
+    if too_new:
+        s = ", ".join(f"{v} ({d}, {a}d old)" for v, d, a in too_new)
+        print(f"{indent}🚫 skipped (too new):        {s}")
+    if py_incompat:
+        s = ", ".join(f"{v} ({d})" for v, d, a in py_incompat)
+        print(f"{indent}🐍 skipped (py incompatible): {s}")
+
+
+def count_safe(info: dict) -> tuple[int, int]:
+    """Return (safe_count, total_count) of stable versions."""
+    total = safe = 0
+    for ver_str, files in info.get("releases", {}).items():
+        if not files:
+            continue
+        try:
+            ver = Version(ver_str)
+        except InvalidVersion:
+            continue
+        if ver.is_prerelease or ver.is_devrelease:
+            continue
+        if not is_python_compatible(files):
+            continue
+        total += 1
+        pub = release_date(files)
+        if pub and pub < CUTOFF:
+            safe += 1
+    return safe, total
+
+
+# ─── Real pip (avoids recursive wrapper calls) ────────────────────────────────
+
+def run_real_pip(args: list[str]) -> None:
+    """Invoke the real pip via sys.executable -m pip (pyenv-safe, no wrapper recursion)."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # SAFE_PIP_ACTIVE=1 tells usercustomize.py not to intercept this call
+    env = {**os.environ, "SAFE_PIP_ACTIVE": "1"}
+    result = subprocess.run([sys.executable, "-m", "pip"] + args, env=env)
+    sys.exit(result.returncode)
+
+
+def resolve_install_plan(pkg_args: list[str], extra_flags: list[str]) -> list[tuple[str, str]] | None:
+    """
+    Use pip dry-run to discover every package (including transitive deps)
+    that would be installed. Returns [(name, version), ...] or None on failure.
+
+    Tries --report JSON first (pip >= 22.2), falls back to stdout parsing.
+    """
+    import tempfile, os
+
+    # Internal pip calls must bypass usercustomize.py to avoid infinite recursion
+    _safe_env = {**os.environ, "SAFE_PIP_ACTIVE": "1"}
+
+    # ── attempt 1: structured JSON report (pip >= 22.2) ──
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        report_path = f.name
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--dry-run",
+             "--report", report_path, "--quiet"] + pkg_args + extra_flags,
+            capture_output=True, text=True, env=_safe_env,
+        )
+        if r.returncode == 0:
+            with open(report_path) as f:
+                data = json.load(f)
+            return [
+                (pkg["metadata"]["name"], pkg["metadata"]["version"])
+                for pkg in data.get("install", [])
+            ]
+    except Exception:
+        pass
+    finally:
+        try:
+            os.unlink(report_path)
+        except OSError:
+            pass
+
+    # ── attempt 2: parse "Would install pkg-ver pkg2-ver2" from stdout ──
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--dry-run"] + pkg_args + extra_flags,
+            capture_output=True, text=True, env=_safe_env,
+        )
+        results = []
+        for line in (r.stdout + r.stderr).splitlines():
+            if "Would install" not in line:
+                continue
+            for token in line.replace("Would install", "").split():
+                # "charset-normalizer-3.4.1" → split on last dash before digit
+                for i in range(len(token) - 1, 0, -1):
+                    if token[i] == "-" and token[i + 1].isdigit():
+                        results.append((token[:i], token[i + 1:]))
+                        break
+        if results:
+            return results
+    except Exception:
+        pass
+
+    # ── attempt 3: PyPI metadata fallback (works with any pip version) ──
+    # Resolve one level of transitive deps by reading requires_dist from PyPI.
+    return _resolve_via_pypi_metadata(pkg_args)
+
+
+def _latest_matching_from_info(info: dict, specifier_str: str) -> str | None:
+    """Latest stable version satisfying specifier_str (ignores publish age)."""
+    spec = SpecifierSet(specifier_str, prereleases=False)
+    candidates = []
+    for ver_str, files in info.get("releases", {}).items():
+        if not files:
+            continue
+        try:
+            ver = Version(ver_str)
+        except InvalidVersion:
+            continue
+        if ver.is_prerelease or ver.is_devrelease:
+            continue
+        if not is_python_compatible(files):
+            continue
+        if specifier_str and ver not in spec:
+            continue
+        candidates.append((ver, ver_str))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda x: x[0])[1]
+
+
+def _resolve_via_pypi_metadata(pkg_args: list[str]) -> list[tuple[str, str]] | None:
+    """
+    Recursively resolve ALL transitive deps via PyPI requires_dist (BFS).
+    Works with any pip version. Each BFS level is fetched in parallel.
+    """
+    # visited: name_lower → (canonical_name, resolved_version)
+    visited: dict = {}
+
+    # Seed: top-level pinned packages (e.g. "requests==2.32.5")
+    frontier: list[tuple[str, str]] = []
+    for arg in pkg_args:
+        try:
+            req = Requirement(arg)
+            ver = str(req.specifier).lstrip("=")
+        except Exception:
+            continue
+        if ver:
+            key = req.name.lower()
+            visited[key] = (req.name, ver)
+            frontier.append((req.name, ver))
+
+    if not frontier:
+        return None
+
+    top_keys = set(visited)  # remember top-level so we exclude them from result
+
+    def _fetch_requires(name: str, version: str) -> list[str]:
+        try:
+            url = f"https://pypi.org/pypi/{name}/{version}/json"
+            r = urllib.request.Request(url, headers={"User-Agent": "safe-pip/1.0"})
+            with urllib.request.urlopen(r, timeout=15) as resp:
+                return json.loads(resp.read()).get("info", {}).get("requires_dist") or []
+        except Exception:
+            return []
+
+    def _resolve_ver(name: str, specifier: str) -> tuple[str, str | None]:
+        try:
+            info = fetch_pypi(name)
+            ver, _ = find_safe_version(info, specifier)
+            if ver is None:
+                ver = _latest_matching_from_info(info, specifier)
+            return name, ver
+        except Exception:
+            return name, None
+
+    while frontier:
+        # ── Step 1: fetch requires_dist for all packages in the current frontier ──
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            meta_futures = {ex.submit(_fetch_requires, n, v): (n, v) for n, v in frontier}
+            all_req_strs: list[str] = []
+            for fut in as_completed(meta_futures):
+                all_req_strs.extend(fut.result())
+
+        # ── Step 2: collect new (unseen) dep names + specifiers ──
+        new_deps: dict[str, tuple[str, str]] = {}  # name_lower → (name, specifier)
+        for req_str in all_req_strs:
+            try:
+                dep = Requirement(req_str)
+                _marker_env = default_environment()
+                _marker_env["extra"] = ""
+                if dep.marker and not dep.marker.evaluate(_marker_env):
+                    continue
+                key = dep.name.lower()
+                if key not in visited and key not in new_deps:
+                    new_deps[key] = (dep.name, str(dep.specifier))
+            except Exception:
+                continue
+
+        if not new_deps:
+            break
+
+        # ── Step 3: resolve safe version for each new dep in parallel ──
+        frontier = []
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            ver_futures = {ex.submit(_resolve_ver, name, spec): key
+                           for key, (name, spec) in new_deps.items()}
+            for fut in as_completed(ver_futures):
+                name, ver = fut.result()
+                key = name.lower()
+                if ver:
+                    visited[key] = (name, ver)
+                    frontier.append((name, ver))
+
+    result = [(name, ver) for key, (name, ver) in visited.items() if key not in top_keys]
+    return result if result else None
+
+
+# ─── Requirement parsing ──────────────────────────────────────────────────────
+
+def parse_req_line(line: str) -> Requirement | None:
+    line = line.strip()
+    if not line or line.startswith("#") or line.startswith("-"):
+        return None
+    try:
+        return Requirement(line)
+    except Exception:
+        return None
+
+
+def load_requirements(path: str) -> list[Requirement]:
+    reqs = []
+    with open(path) as f:
+        for line in f:
+            r = parse_req_line(line)
+            if r:
+                reqs.append(r)
+    return reqs
+
+
+# ─── Handlers ─────────────────────────────────────────────────────────────────
+
+def check_package(name: str, specifier: str = "") -> dict:
+    """Query PyPI and return result dict."""
+    try:
+        info = fetch_pypi(name)
+        latest = info.get("info", {}).get("version", "?")
+        safe_ver, safe_pub = find_safe_version(info, specifier)
+        safe_count, total = count_safe(info)
+
+        if not safe_ver:
+            return {"name": name, "specifier": specifier, "safe_ver": None,
+                    "latest": latest, "safe_count": safe_count, "total": total}
+
+        downgraded = safe_ver != latest
+        skipped = get_skipped(info, safe_ver, specifier) if downgraded else []
+        return {"name": name, "specifier": specifier, "safe_ver": safe_ver,
+                "latest": latest, "pub_date": safe_pub.strftime("%Y-%m-%d"),
+                "downgraded": downgraded, "skipped": skipped}
+    except Exception as e:
+        return {"name": name, "specifier": specifier, "safe_ver": None, "error": str(e)}
+
+
+def handle_install(pkg_args: list[str], flags: list[str], upgrade: bool) -> None:
+    if not pkg_args:
+        run_real_pip(["install"] + flags)
+        return
+
+    print(f"\n[safe-pip] Checking {len(pkg_args)} package(s) — "
+          f"only versions >{SAFE_AGE_DAYS} days old allowed\n")
+
+    # Parse each arg into (name, specifier)
+    requests = []
+    passthrough = []  # already-installed packages that don't need checking
+    for arg in pkg_args:
+        try:
+            req = Requirement(arg)
+            name, spec = req.name, str(req.specifier)
+        except Exception:
+            name, spec = arg, ""
+
+        # Without -U: if already installed and satisfies the specifier, skip
+        # PyPI check and let pip handle it (→ "Requirement already satisfied")
+        if not upgrade:
+            installed = get_installed_version(name)
+            if installed:
+                try:
+                    ver = Version(installed)
+                    if not spec or ver in SpecifierSet(spec):
+                        passthrough.append((name, installed, arg))
+                        continue
+                except Exception:
+                    pass
+
+        requests.append((name, spec, arg))
+
+    for name, installed, _ in passthrough:
+        print(f"✅  {name}=={installed} already installed — skipping PyPI check")
+
+    if not requests:
+        # All packages already installed, just run pip as-is
+        print(f"\n[safe-pip] Running: pip install {' '.join(pkg_args + flags)}\n")
+        run_real_pip(["install"] + pkg_args + flags)
+        return
+
+    # Parallel PyPI queries for packages not yet installed (or being upgraded)
+    results = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(check_package, name, spec): orig
+                   for name, spec, orig in requests}
+        for fut in as_completed(futures):
+            orig = futures[fut]
+            results[orig] = fut.result()
+
+    blocked = False
+    pinned_args = []
+
+    for _, spec, orig in requests:
+        r = results[orig]
+        name = r["name"]
+        if "error" in r:
+            print(f"❌  {name}: {r['error']}", file=sys.stderr)
+            blocked = True
+        elif not r["safe_ver"]:
+            print(f"❌  {name}: no safe version "
+                  f"({r['safe_count']}/{r['total']} versions >{SAFE_AGE_DAYS}d old"
+                  + (f', none match "{r["specifier"]}"' if r.get("specifier") else "") + ")",
+                  file=sys.stderr)
+            blocked = True
+        elif r["downgraded"]:
+            spec_str = f'[{r["specifier"]}]' if r.get("specifier") else ""
+            print(f"⬇️   {name}{spec_str}: {r['latest']} too new → {r['safe_ver']} ({r['pub_date']})")
+            if r["skipped"]:
+                _print_skipped(r["skipped"])
+            print(f"     📌 pinned:  {name}=={r['safe_ver']}")
+            pinned_args.append(f"{name}=={r['safe_ver']}")
+        else:
+            print(f"✅  {name}=={r['safe_ver']} ({r['pub_date']}) — safe")
+            pinned_args.append(f"{name}=={r['safe_ver']}")
+
+    if blocked:
+        print(f"\n[safe-pip] ❌  Install blocked. Use --unsafe to bypass.\n",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # ── Check transitive dependencies via pip dry-run ──────────────────────
+    install_flags = ["--upgrade"] if upgrade else []
+    passthrough_args = [arg for _, _, arg in passthrough]
+    all_pinned = pinned_args + passthrough_args
+
+    plan = resolve_install_plan(all_pinned, install_flags + flags)
+    if plan:
+        # Filter out packages already covered by our top-level check
+        top_level_names = {r["name"].lower() for r in results.values() if r.get("safe_ver")}
+        transitive = [(n, v) for n, v in plan if n.lower() not in top_level_names]
+
+        if transitive:
+            print(f"[safe-pip] Checking {len(transitive)} transitive dependenc{'y' if len(transitive)==1 else 'ies'}...\n")
+            trans_results = {}
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                # Check against "" (no specifier) so we always compare with the
+                # actual latest — this surfaces downgrades even when _resolve_via_pypi_metadata
+                # already returned the safe version.
+                futures = {ex.submit(check_package, name, ""): (name, ver)
+                           for name, ver in transitive}
+                for fut in as_completed(futures):
+                    name, ver = futures[fut]
+                    trans_results[(name, ver)] = fut.result()
+
+            trans_blocked = False
+            trans_pinned = []
+            for name, ver in transitive:
+                r = trans_results[(name, ver)]
+                if "error" in r:
+                    trans_pinned.append(f"{name}=={ver}")  # unreachable → pass through
+                elif not r.get("safe_ver"):
+                    print(f"❌  {name}: no safe version exists (dep)")
+                    trans_blocked = True
+                elif r.get("downgraded"):
+                    print(f"⬇️   {name} (dep): {r['latest']} too new "
+                          f"→ {r['safe_ver']} ({r['pub_date']})")
+                    if r.get("skipped"):
+                        _print_skipped(r["skipped"])
+                    print(f"     📌 pinned:  {name}=={r['safe_ver']}")
+                    trans_pinned.append(f"{name}=={r['safe_ver']}")
+                else:
+                    print(f"✅  {name}=={r['safe_ver']} ({r['pub_date']}) — dep safe")
+                    trans_pinned.append(f"{name}=={r['safe_ver']}")
+
+            if trans_blocked:
+                bypass_flags = [f for f in flags if f not in ("-U", "--upgrade")]
+                orig_cmd = " ".join(pkg_args + bypass_flags)
+                print(
+                    f"\n[safe-pip] ❌  Install blocked: transitive dep(s) have no safe version.\n"
+                    f"\n"
+                    f"  To bypass:  pip install --unsafe {orig_cmd}\n",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            all_pinned = all_pinned + trans_pinned
+
+    print(f"\n[safe-pip] Running: pip install {' '.join(all_pinned + flags)}\n")
+    run_real_pip(["install"] + install_flags + all_pinned + flags)
+
+
+def handle_requirements(req_file: str, flags: list[str], upgrade: bool) -> None:
+    try:
+        reqs = load_requirements(req_file)
+    except FileNotFoundError:
+        print(f"[safe-pip] requirements file not found: {req_file}", file=sys.stderr)
+        sys.exit(1)
+
+    if not reqs:
+        run_real_pip(["install", "-r", req_file] + flags)
+        return
+
+    print(f"\n[safe-pip] Checking {len(reqs)} package(s) from {req_file} — "
+          f"only versions >{SAFE_AGE_DAYS} days old allowed\n")
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(check_package, req.name, str(req.specifier)): req
+                   for req in reqs}
+        for fut in as_completed(futures):
+            req = futures[fut]
+            results[req.name] = fut.result()
+
+    blocked = False
+    for req in reqs:
+        r = results[req.name]
+        name = r["name"]
+        if "error" in r:
+            print(f"❌  {name}: {r['error']}", file=sys.stderr)
+            blocked = True
+        elif not r["safe_ver"]:
+            print(f"❌  {name}: no safe version "
+                  f"({r['safe_count']}/{r['total']} versions >{SAFE_AGE_DAYS}d old)",
+                  file=sys.stderr)
+            blocked = True
+        elif r["downgraded"]:
+            spec_str = f'[{r["specifier"]}]' if r.get("specifier") else ""
+            print(f"⬇️   {name}{spec_str}: {r['latest']} too new → {r['safe_ver']} ({r['pub_date']})")
+            if r["skipped"]:
+                _print_skipped(r["skipped"])
+            print(f"     📌 pinned:  {name}=={r['safe_ver']}")
+        else:
+            print(f"✅  {name}=={r['safe_ver']} ({r['pub_date']}) — safe")
+
+    if blocked:
+        print(f"\n[safe-pip] ❌  Install blocked. Use --unsafe to bypass.\n",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Install with pinned safe versions instead of raw requirements.txt
+    # (the original file's ranges could still resolve to unsafe versions)
+    pinned = [f"{r['name']}=={r['safe_ver']}" for r in
+              (results[req.name] for req in reqs) if r.get("safe_ver")]
+    install_flags = ["--upgrade"] if upgrade else []
+    print(f"\n[safe-pip] Running: pip install {' '.join(pinned)}\n")
+    run_real_pip(["install"] + install_flags + pinned + flags)
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+INSTALL_DIR = os.path.expanduser("~/.safe-pip")
+DISABLED_FLAG = os.path.join(INSTALL_DIR, "disabled")
+
+
+def _cmd_disable():
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    with open(DISABLED_FLAG, "w") as f:
+        pass
+    print("[safe-pip] ✅  Disabled — safety checks bypassed until you run: safe-pip enable")
+
+
+def _cmd_enable():
+    if os.path.exists(DISABLED_FLAG):
+        os.remove(DISABLED_FLAG)
+        print("[safe-pip] ✅  Enabled — safety checks are active.")
+    else:
+        print("[safe-pip] Already enabled.")
+
+
+def _cmd_status():
+    disabled = os.path.exists(DISABLED_FLAG)
+    state = "🔴 DISABLED" if disabled else "🟢 ENABLED"
+    print(f"[safe-pip] Status: {state}")
+    print(f"           Age threshold: {SAFE_AGE_DAYS} days (SAFE_PIP_AGE_DAYS)")
+
+
+def main():
+    args = sys.argv[1:]
+
+    # Built-in management subcommands (intercept before passing to pip)
+    if args and args[0] == "disable":
+        _cmd_disable(); return
+    if args and args[0] == "enable":
+        _cmd_enable(); return
+    if args and args[0] == "status":
+        _cmd_status(); return
+
+    # Sentinel file: disabled → pass everything straight to pip
+    if os.path.exists(DISABLED_FLAG):
+        run_real_pip(args)
+        return
+
+    if not args:
+        run_real_pip([])
+        return
+
+    # --unsafe: bypass all safety checks (we don't use --force to avoid
+    # collision with pip's own --force-reinstall flag)
+    if "--unsafe" in args:
+        print("[safe-pip] ⚠️   --unsafe detected — skipping safety checks!\n")
+        run_real_pip([a for a in args if a != "--unsafe"])
+        return
+
+    cmd = args[0]
+
+    if cmd != "install":
+        run_real_pip(args)
+        return
+
+    # Parse install subcommand
+    rest = args[1:]
+    upgrade = "-U" in rest or "--upgrade" in rest
+
+    # Check for -r / --requirement first (its value is a filename, not a package)
+    req_file = None
+    skip_indices = set()
+    for i, a in enumerate(rest):
+        if a in ("-r", "--requirement") and i + 1 < len(rest):
+            req_file = rest[i + 1]
+            skip_indices |= {i, i + 1}
+            break
+        if a.startswith("--requirement="):
+            req_file = a.split("=", 1)[1]
+            skip_indices.add(i)
+            break
+
+    # Separate flags and package args, excluding -r/--requirement and its value
+    flags = [a for i, a in enumerate(rest) if i not in skip_indices and a.startswith("-")]
+    pkg_args = [a for i, a in enumerate(rest) if i not in skip_indices and not a.startswith("-")]
+
+    if req_file:
+        other_flags = [f for f in flags if f not in ("-r", "--requirement")]
+        handle_requirements(req_file, other_flags, upgrade)
+    elif pkg_args:
+        handle_install(pkg_args, flags, upgrade)
+    else:
+        run_real_pip(args)
+
+
+if __name__ == "__main__":
+    main()
