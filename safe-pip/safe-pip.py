@@ -289,8 +289,10 @@ def _resolve_via_pypi_metadata(pkg_args: list[str]) -> list[tuple[str, str]] | N
     # visited: name_lower → (canonical_name, resolved_version)
     visited: dict = {}
 
-    # Seed: top-level pinned packages (e.g. "requests==2.32.5")
-    frontier: list[tuple[str, str]] = []
+    # Seed: top-level pinned packages (e.g. "requests[socks]==2.32.5")
+    # frontier entries: (name, version, extras) — extras are the requested extras
+    # for this package, used when evaluating extra-conditional markers below.
+    frontier: list[tuple[str, str, frozenset]] = []
     for arg in pkg_args:
         try:
             req = Requirement(arg)
@@ -300,12 +302,17 @@ def _resolve_via_pypi_metadata(pkg_args: list[str]) -> list[tuple[str, str]] | N
         if ver:
             key = req.name.lower()
             visited[key] = (req.name, ver)
-            frontier.append((req.name, ver))
+            frontier.append((req.name, ver, frozenset(e.lower() for e in req.extras)))
 
     if not frontier:
         return None
 
     top_keys = set(visited)  # remember top-level so we exclude them from result
+    # Track which extras have already been walked per package so we can detect
+    # when a new extras combination requires re-queuing an already-visited node.
+    visited_extras: dict[str, frozenset] = {k: frozenset() for k in visited}
+    # Extra-merge queue: already-visited packages that need re-walking with new extras.
+    frontier_extra_queue: list[tuple[str, str, frozenset]] = []
 
     def _fetch_requires(name: str, version: str) -> list[str]:
         try:
@@ -326,43 +333,76 @@ def _resolve_via_pypi_metadata(pkg_args: list[str]) -> list[tuple[str, str]] | N
         except Exception:
             return name, None
 
-    while frontier:
+    while frontier or frontier_extra_queue:
+        # Drain the extra-merge queue into the main frontier so re-queued packages
+        # (already visited but with newly discovered extras) are walked this round.
+        if frontier_extra_queue:
+            frontier.extend(frontier_extra_queue)
+            frontier_extra_queue.clear()
         # ── Step 1: fetch requires_dist for all packages in the current frontier ──
         with ThreadPoolExecutor(max_workers=10) as ex:
-            meta_futures = {ex.submit(_fetch_requires, n, v): (n, v) for n, v in frontier}
-            all_req_strs: list[str] = []
+            meta_futures = {ex.submit(_fetch_requires, n, v): (n, v, extras)
+                            for n, v, extras in frontier}
+            # Carry (req_str, parent_extras) so Step 2 can evaluate extra markers correctly.
+            all_req_pairs: list[tuple[str, frozenset]] = []
             for fut in as_completed(meta_futures):
-                all_req_strs.extend(fut.result())
+                _, _, extras = meta_futures[fut]
+                for req_str in fut.result():
+                    all_req_pairs.append((req_str, extras))
 
-        # ── Step 2: collect new (unseen) dep names + specifiers ──
-        new_deps: dict[str, tuple[str, str]] = {}  # name_lower → (name, specifier)
-        for req_str in all_req_strs:
+        # ── Step 2: collect new (unseen) dep names + specifiers + their own extras ──
+        new_deps: dict[str, tuple[str, str, frozenset]] = {}  # name_lower → (name, specifier, extras)
+        for req_str, parent_extras in all_req_pairs:
             try:
                 dep = Requirement(req_str)
-                _marker_env = default_environment()
-                _marker_env["extra"] = ""
-                if dep.marker and not dep.marker.evaluate(_marker_env):
+                base_env = default_environment()
+                # A dep is included if it passes with the empty-extra environment OR
+                # with any of the extras that were explicitly requested for its parent.
+                extras_to_check = parent_extras | {""}
+                if dep.marker and not any(
+                    dep.marker.evaluate({**base_env, "extra": e})
+                    for e in extras_to_check
+                ):
                     continue
                 key = dep.name.lower()
-                if key not in visited and key not in new_deps:
-                    new_deps[key] = (dep.name, str(dep.specifier))
+                dep_extras = frozenset(e.lower() for e in dep.extras)
+                if key in visited:
+                    # Already resolved — but if new extras were requested, re-queue so
+                    # extra-gated children (e.g. "C; extra == 'foo'") get walked.
+                    existing_extras = visited_extras.get(key, frozenset())
+                    added = dep_extras - existing_extras
+                    if added:
+                        visited_extras[key] = existing_extras | added
+                        name_v, ver_v = visited[key]
+                        frontier_extra_queue.append((name_v, ver_v, dep_extras))
+                elif key in new_deps:
+                    # Seen in this BFS level with different extras — merge them.
+                    name_e, spec_e, extras_e = new_deps[key]
+                    new_deps[key] = (name_e, spec_e, extras_e | dep_extras)
+                else:
+                    # Carry the dep's own extras forward so its children's extra markers
+                    # (e.g. "A -> B[foo]" -> "C; extra == 'foo'") are evaluated correctly.
+                    new_deps[key] = (dep.name, str(dep.specifier), dep_extras)
             except Exception:
                 continue
 
         if not new_deps:
-            break
+            if not frontier_extra_queue:
+                break
+            continue
 
         # ── Step 3: resolve safe version for each new dep in parallel ──
         frontier = []
         with ThreadPoolExecutor(max_workers=10) as ex:
-            ver_futures = {ex.submit(_resolve_ver, name, spec): key
-                           for key, (name, spec) in new_deps.items()}
+            ver_futures = {ex.submit(_resolve_ver, name, spec): (key, extras)
+                           for key, (name, spec, extras) in new_deps.items()}
             for fut in as_completed(ver_futures):
+                key, extras = ver_futures[fut]
                 name, ver = fut.result()
-                key = name.lower()
                 if ver:
                     visited[key] = (name, ver)
-                    frontier.append((name, ver))
+                    visited_extras[key] = extras
+                    frontier.append((name, ver, extras))
 
     result = [(name, ver) for key, (name, ver) in visited.items() if key not in top_keys]
     return result if result else None
@@ -421,19 +461,24 @@ def handle_install(pkg_args: list[str], flags: list[str], upgrade: bool) -> None
     print(f"\n[safe-pip] Checking {len(pkg_args)} package(s) — "
           f"only versions >{SAFE_AGE_DAYS} days old allowed\n")
 
-    # Parse each arg into (name, specifier)
+    # Parse each arg into (name, specifier, orig_arg, extras_str)
     requests = []
     passthrough = []  # already-installed packages that don't need checking
     for arg in pkg_args:
         try:
             req = Requirement(arg)
-            name, spec = req.name, str(req.specifier)
+            name = req.name
+            spec = str(req.specifier)
+            # Preserve extras like [socks] in "requests[socks]>=2.0"
+            extras_str = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
         except Exception:
-            name, spec = arg, ""
+            name, spec, extras_str = arg, "", ""
 
         # Without -U: if already installed and satisfies the specifier, skip
-        # PyPI check and let pip handle it (→ "Requirement already satisfied")
-        if not upgrade:
+        # PyPI check and let pip handle it (→ "Requirement already satisfied").
+        # Skip this fast-path when extras are requested — they may pull in new
+        # transitive deps that haven't been audited yet.
+        if not upgrade and not extras_str:
             installed = get_installed_version(name)
             if installed:
                 try:
@@ -444,7 +489,7 @@ def handle_install(pkg_args: list[str], flags: list[str], upgrade: bool) -> None
                 except Exception:
                     pass
 
-        requests.append((name, spec, arg))
+        requests.append((name, spec, arg, extras_str))
 
     for name, installed, _ in passthrough:
         print(f"✅  {name}=={installed} already installed — skipping PyPI check")
@@ -459,7 +504,7 @@ def handle_install(pkg_args: list[str], flags: list[str], upgrade: bool) -> None
     results = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
         futures = {ex.submit(check_package, name, spec): orig
-                   for name, spec, orig in requests}
+                   for name, spec, orig, _extras in requests}
         for fut in as_completed(futures):
             orig = futures[fut]
             results[orig] = fut.result()
@@ -467,7 +512,7 @@ def handle_install(pkg_args: list[str], flags: list[str], upgrade: bool) -> None
     blocked = False
     pinned_args = []
 
-    for _, spec, orig in requests:
+    for _, spec, orig, extras_str in requests:
         r = results[orig]
         name = r["name"]
         if "error" in r:
@@ -484,11 +529,11 @@ def handle_install(pkg_args: list[str], flags: list[str], upgrade: bool) -> None
             print(f"⬇️   {name}{spec_str}: {r['latest']} too new → {r['safe_ver']} ({r['pub_date']})")
             if r["skipped"]:
                 _print_skipped(r["skipped"])
-            print(f"     📌 pinned:  {name}=={r['safe_ver']}")
-            pinned_args.append(f"{name}=={r['safe_ver']}")
+            print(f"     📌 pinned:  {name}{extras_str}=={r['safe_ver']}")
+            pinned_args.append(f"{name}{extras_str}=={r['safe_ver']}")
         else:
-            print(f"✅  {name}=={r['safe_ver']} ({r['pub_date']}) — safe")
-            pinned_args.append(f"{name}=={r['safe_ver']}")
+            print(f"✅  {name}{extras_str}=={r['safe_ver']} ({r['pub_date']}) — safe")
+            pinned_args.append(f"{name}{extras_str}=={r['safe_ver']}")
 
     if blocked:
         print(f"\n[safe-pip] ❌  Install blocked. Use --unsafe to bypass.\n",
@@ -500,60 +545,72 @@ def handle_install(pkg_args: list[str], flags: list[str], upgrade: bool) -> None
     passthrough_args = [arg for _, _, arg in passthrough]
     all_pinned = pinned_args + passthrough_args
 
-    plan = resolve_install_plan(all_pinned, install_flags + flags)
-    if plan:
-        # Filter out packages already covered by our top-level check
-        top_level_names = {r["name"].lower() for r in results.values() if r.get("safe_ver")}
-        transitive = [(n, v) for n, v in plan if n.lower() not in top_level_names]
-
-        if transitive:
-            print(f"[safe-pip] Checking {len(transitive)} transitive dependenc{'y' if len(transitive)==1 else 'ies'}...\n")
-            trans_results = {}
-            with ThreadPoolExecutor(max_workers=10) as ex:
-                # Check against "" (no specifier) so we always compare with the
-                # actual latest — this surfaces downgrades even when _resolve_via_pypi_metadata
-                # already returned the safe version.
-                futures = {ex.submit(check_package, name, ""): (name, ver)
-                           for name, ver in transitive}
-                for fut in as_completed(futures):
-                    name, ver = futures[fut]
-                    trans_results[(name, ver)] = fut.result()
-
-            trans_blocked = False
-            trans_pinned = []
-            for name, ver in transitive:
-                r = trans_results[(name, ver)]
-                if "error" in r:
-                    trans_pinned.append(f"{name}=={ver}")  # unreachable → pass through
-                elif not r.get("safe_ver"):
-                    print(f"❌  {name}: no safe version exists (dep)")
-                    trans_blocked = True
-                elif r.get("downgraded"):
-                    print(f"⬇️   {name} (dep): {r['latest']} too new "
-                          f"→ {r['safe_ver']} ({r['pub_date']})")
-                    if r.get("skipped"):
-                        _print_skipped(r["skipped"])
-                    print(f"     📌 pinned:  {name}=={r['safe_ver']}")
-                    trans_pinned.append(f"{name}=={r['safe_ver']}")
-                else:
-                    print(f"✅  {name}=={r['safe_ver']} ({r['pub_date']}) — dep safe")
-                    trans_pinned.append(f"{name}=={r['safe_ver']}")
-
-            if trans_blocked:
-                bypass_flags = [f for f in flags if f not in ("-U", "--upgrade")]
-                orig_cmd = " ".join(pkg_args + bypass_flags)
-                print(
-                    f"\n[safe-pip] ❌  Install blocked: transitive dep(s) have no safe version.\n"
-                    f"\n"
-                    f"  To bypass:  pip install --unsafe {orig_cmd}\n",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
-            all_pinned = all_pinned + trans_pinned
+    top_level_names = {r["name"].lower() for r in results.values() if r.get("safe_ver")}
+    all_pinned = _check_transitives(all_pinned, top_level_names, install_flags, flags)
 
     print(f"\n[safe-pip] Running: pip install {' '.join(all_pinned + flags)}\n")
     run_real_pip(["install"] + install_flags + all_pinned + flags)
+
+
+def _check_transitives(
+    all_pinned: list[str],
+    top_level_names: set[str],
+    install_flags: list[str],
+    flags: list[str],
+) -> list[str]:
+    """Run transitive dependency check via pip dry-run + PyPI BFS.
+    Returns the extended pinned list (top-level + safe transitive pins).
+    Exits on block."""
+    plan = resolve_install_plan(all_pinned, install_flags + flags)
+    if not plan:
+        return all_pinned
+
+    transitive = [(n, v) for n, v in plan if n.lower() not in top_level_names]
+    if not transitive:
+        return all_pinned
+
+    print(f"[safe-pip] Checking {len(transitive)} transitive dependenc{'y' if len(transitive)==1 else 'ies'}...\n")
+    trans_results = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        # Check against "" (no specifier) so we always compare with the
+        # actual latest — this surfaces downgrades even when _resolve_via_pypi_metadata
+        # already returned the safe version.
+        futures = {ex.submit(check_package, name, ""): (name, ver)
+                   for name, ver in transitive}
+        for fut in as_completed(futures):
+            name, ver = futures[fut]
+            trans_results[(name, ver)] = fut.result()
+
+    trans_blocked = False
+    trans_pinned = []
+    for name, ver in transitive:
+        r = trans_results[(name, ver)]
+        if "error" in r:
+            trans_pinned.append(f"{name}=={ver}")  # unreachable → pass through
+        elif not r.get("safe_ver"):
+            print(f"❌  {name}: no safe version exists (dep)")
+            trans_blocked = True
+        elif r.get("downgraded"):
+            print(f"⬇️   {name} (dep): {r['latest']} too new "
+                  f"→ {r['safe_ver']} ({r['pub_date']})")
+            if r.get("skipped"):
+                _print_skipped(r["skipped"])
+            print(f"     📌 pinned:  {name}=={r['safe_ver']}")
+            trans_pinned.append(f"{name}=={r['safe_ver']}")
+        else:
+            print(f"✅  {name}=={r['safe_ver']} ({r['pub_date']}) — dep safe")
+            trans_pinned.append(f"{name}=={r['safe_ver']}")
+
+    if trans_blocked:
+        print(
+            f"\n[safe-pip] ❌  Install blocked: transitive dep(s) have no safe version.\n"
+            f"\n"
+            f"  Use --unsafe to bypass.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return all_pinned + trans_pinned
 
 
 def handle_requirements(req_file: str, flags: list[str], upgrade: bool) -> None:
@@ -609,6 +666,7 @@ def handle_requirements(req_file: str, flags: list[str], upgrade: bool) -> None:
     pinned = [f"{r['name']}=={r['safe_ver']}" for r in
               (results[req.name] for req in reqs) if r.get("safe_ver")]
     install_flags = ["--upgrade"] if upgrade else []
+
     print(f"\n[safe-pip] Running: pip install {' '.join(pinned)}\n")
     run_real_pip(["install"] + install_flags + pinned + flags)
 
@@ -678,22 +736,71 @@ def main():
     rest = args[1:]
     upgrade = "-U" in rest or "--upgrade" in rest
 
-    # Check for -r / --requirement first (its value is a filename, not a package)
+    # pip install flags that take a value argument (their value is NOT a package name)
+    _PIP_VALUE_FLAGS = {
+        "-i", "--index-url", "--extra-index-url",
+        "-c", "--constraint", "-t", "--target",
+        "--prefix", "--root", "--python-version", "--platform",
+        "--implementation", "--abi", "--upgrade-strategy",
+        "--no-binary", "--only-binary", "--trusted-host",
+        "--cert", "--client-cert", "--cache-dir", "--log",
+        "--proxy", "--retries", "--timeout",
+        "-f", "--find-links", "--progress-bar", "--global-option",
+        "-C", "--config-settings",
+    }
+
+    # Parse rest to identify -r/--requirement and value-taking flags.
+    # skip_indices: entirely excluded (-r flag + its filename)
+    # value_indices: values of other flags (excluded from pkg_args but kept in flags passthrough)
     req_file = None
-    skip_indices = set()
-    for i, a in enumerate(rest):
+    skip_indices: set[int] = set()
+    value_indices: set[int] = set()
+
+    i = 0
+    while i < len(rest):
+        a = rest[i]
         if a in ("-r", "--requirement") and i + 1 < len(rest):
             req_file = rest[i + 1]
             skip_indices |= {i, i + 1}
-            break
+            i += 2
+            continue
         if a.startswith("--requirement="):
             req_file = a.split("=", 1)[1]
             skip_indices.add(i)
-            break
+        elif a in _PIP_VALUE_FLAGS and i + 1 < len(rest):
+            # Space-separated form: --index-url URL (not --index-url=URL)
+            value_indices.add(i + 1)
+        i += 1
 
-    # Separate flags and package args, excluding -r/--requirement and its value
-    flags = [a for i, a in enumerate(rest) if i not in skip_indices and a.startswith("-")]
-    pkg_args = [a for i, a in enumerate(rest) if i not in skip_indices and not a.startswith("-")]
+    # Separate flags and package args
+    flags = [a for i, a in enumerate(rest)
+             if i not in skip_indices and (a.startswith("-") or i in value_indices)]
+    pkg_args = [a for i, a in enumerate(rest)
+                if i not in skip_indices and i not in value_indices and not a.startswith("-")]
+
+    # Alternate indexes can't be audited — safe-pip only checks pypi.org.
+    # Flags that change the package source or install location can't be safely audited:
+    # - Index/source overrides: pip installs from a different source than safe-pip audits
+    # - Install location overrides (--target/--root/--prefix): the already-installed
+    #   passthrough checks the current environment, not the target directory
+    _UNAUDITABLE = {
+        "--index-url", "--extra-index-url", "--find-links", "--no-index",
+        "-t", "--target", "--root", "--prefix",
+    }
+    if any(f in _UNAUDITABLE or
+           f.startswith("--index-url=") or f.startswith("--extra-index-url=") or
+           f.startswith("--find-links=") or
+           f.startswith("--target=") or f.startswith("--root=") or f.startswith("--prefix=") or
+           (f.startswith("-t") and len(f) > 2) or
+           f == "-i" or (f.startswith("-i") and len(f) > 2) or
+           f == "-f" or (f.startswith("-f") and len(f) > 2)
+           for f in flags):
+        print("[safe-pip] ❌  Alternate package sources or install locations\n"
+              "           (--index-url, --extra-index-url, --find-links, --no-index,\n"
+              "           --target, --root, --prefix) are not supported by safe-pip.\n"
+              "           Use --unsafe to bypass safety checks, or run pip directly.\n",
+              file=sys.stderr)
+        sys.exit(1)
 
     if req_file:
         other_flags = [f for f in flags if f not in ("-r", "--requirement")]

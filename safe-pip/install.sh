@@ -82,8 +82,21 @@ _install_usercustomize() {
   user_site=$("$python_bin" -m site --user-site 2>/dev/null) || return
   [[ -n "$user_site" ]] || return
   mkdir -p "$user_site"
-  cp "$INSTALL_DIR/usercustomize.py" "$user_site/usercustomize.py"
-  info "Installed usercustomize.py → $user_site"
+
+  local target="$user_site/usercustomize.py"
+  if [[ -f "$target" ]] && ! grep -q "safe-pip usercustomize hook" "$target" 2>/dev/null; then
+    # An existing, non-safe-pip usercustomize.py is present.
+    # Back it up and warn — do NOT silently overwrite it.
+    local backup="$user_site/usercustomize_pre_safepip.py"
+    cp "$target" "$backup"
+    cp "$INSTALL_DIR/usercustomize.py" "$target"
+    warn "Existing usercustomize.py backed up → $backup"
+    warn "If you had custom startup code there, merge it back manually."
+    info "Installed usercustomize.py → $user_site"
+  else
+    cp "$INSTALL_DIR/usercustomize.py" "$target"
+    info "Installed usercustomize.py → $user_site"
+  fi
 }
 
 _install_usercustomize python3

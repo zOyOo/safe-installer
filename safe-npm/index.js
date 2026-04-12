@@ -4,6 +4,7 @@
 const https   = require('https');
 const { spawn } = require('child_process');
 const fs      = require('fs');
+const os      = require('os');
 const path    = require('path');
 const semver  = require('semver');
 
@@ -246,9 +247,70 @@ function runNpmSilent(args) {
   });
 }
 
+// Silent npm in a specific directory — used for global install temp-dir resolution.
+function runNpmSilentInDir(cwd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(REAL_NPM, args, { stdio: ['inherit', 'ignore', 'inherit'], env: safeEnv, cwd });
+    child.on('close', code => resolve(code ?? 0));
+    child.on('error', reject);
+  });
+}
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 const isFlag = a => a.startsWith('-');
+
+// npm install/update flags that take a value argument (so values aren't mistaken for packages)
+const NPM_INSTALL_VALUE_FLAGS = new Set([
+  '--workspace', '-w', '--prefix', '--registry', '--tag', '--otp',
+  '--userconfig', '--globalconfig', '--cache', '--proxy', '--https-proxy',
+  '--noproxy', '--cert', '--key', '--cafile', '--depth', '--maxsockets',
+  '--location',
+]);
+
+/**
+ * Split args into { flags, pkgArgs }, correctly handling value-taking flags.
+ * e.g. ['--workspace', 'app', 'lodash'] → flags=['--workspace','app'], pkgArgs=['lodash']
+ */
+function splitFlagsAndPkgs(args) {
+  const flags = [];
+  const pkgArgs = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('-')) {
+      flags.push(a);
+      // Space-separated value: --flag value (not --flag=value)
+      const bare = a.includes('=') ? null : a;
+      if (bare && NPM_INSTALL_VALUE_FLAGS.has(bare) && i + 1 < args.length && !args[i + 1].startsWith('-')) {
+        flags.push(args[++i]);
+      }
+    } else {
+      pkgArgs.push(a);
+    }
+  }
+  return { flags, pkgArgs };
+}
+
+/**
+ * Detect and strip global install flags (-g, --global, --location=global, --location global).
+ * Returns { isGlobal, strippedFlags } where strippedFlags has global flags removed.
+ */
+function extractGlobalFlag(flags) {
+  const stripped = [];
+  let isGlobal = false;
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i];
+    if (f === '-g' || f === '--global' || f === '--location=global') {
+      isGlobal = true;
+    } else if (f === '--location' && flags[i + 1] === 'global') {
+      isGlobal = true;
+      i++; // skip the 'global' value token
+    } else {
+      stripped.push(f);
+    }
+  }
+  return { isGlobal, strippedFlags: stripped };
+}
 
 function readJson(filePath) {
   try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); }
@@ -269,7 +331,9 @@ function extractLockfilePackages(lockJson) {
   if (lockJson.packages) {
     for (const [key, val] of Object.entries(lockJson.packages)) {
       if (!key || !val.version) continue; // skip root entry ("")
-      out.push({ name: key.replace(/^node_modules\//, ''), version: val.version });
+      // For nested deps like "node_modules/a/node_modules/b", take the last segment
+      const parts = key.split('node_modules/');
+      out.push({ name: parts[parts.length - 1], version: val.version });
     }
   } else if (lockJson.dependencies) {
     const collect = (deps) => {
@@ -320,8 +384,10 @@ async function auditPackageList(packages, { silent = false } = {}) {
 /**
  * safe-npm install <pkg...>
  * Finds the latest safe version of each requested package, then delegates to npm.
+ * If isGlobal is true, lockfile resolution happens in a temp dir (npm ignores
+ * --package-lock-only for global installs), then the actual install uses -g.
  */
-async function handleInstallWithPackages(pkgArgs, flags) {
+async function handleInstallWithPackages(pkgArgs, flags, { isGlobal = false } = {}) {
   console.log(`\n[safe-npm] Checking ${pkgArgs.length} package(s) — only versions >${SAFE_AGE_DAYS} days old allowed\n`);
 
   const results = await Promise.all(pkgArgs.map(async (arg) => {
@@ -381,7 +447,7 @@ async function handleInstallWithPackages(pkgArgs, flags) {
   }
 
   const pinnedArgs = results.map(r => `${r.name}@${r.safeVer}`);
-  const allPinned  = [...pinnedArgs]; // will grow with transitive pins
+  let allPinned  = [...pinnedArgs]; // will grow with transitive pins
 
   // ── Phase 1: BFS over registry — informational display + collect safe pins ──
   const transitive = await resolveTransitiveDeps(results.filter(r => r.safeVer));
@@ -447,28 +513,44 @@ async function handleInstallWithPackages(pkgArgs, flags) {
       console.error(`\n[safe-npm] ❌  Install blocked: transitive dep(s) have no safe version.\n`);
       process.exit(1);
     }
-
-    allPinned.push(...transPinned);
+    allPinned = [...allPinned, ...transPinned];
   }
 
-  // ── Phase 2: Let npm fully resolve the dep tree into the lockfile ────────────
-  // npm install --package-lock-only writes the lockfile without touching node_modules.
-  // This lets npm's own resolver (deduplication, peer deps, hoisting) run in full,
-  // giving us the authoritative set of packages that will be installed.
-  // It also updates package.json (adds the dependency), so we back up both.
-  const lockPath = path.join(process.cwd(), 'package-lock.json');
-  const pkgPath  = path.join(process.cwd(), 'package.json');
-  const lockBackup = fs.existsSync(lockPath) ? fs.readFileSync(lockPath) : null;
-  const pkgBackup  = fs.existsSync(pkgPath)  ? fs.readFileSync(pkgPath)  : null;
+  // ── Phase 2: Resolve full dep tree into a lockfile ──────────────────────────
+  // For local installs: resolve in cwd using --package-lock-only (writes lockfile
+  // + package.json), back up both so we can restore on failure.
+  // For global installs: npm ignores --package-lock-only with -g, so resolve in a
+  // temp directory instead — no cwd files are touched.
+  let lockPath, lockBackup = null, pkgBackup = null, tmpDir = null;
 
-  console.log(`\n[safe-npm] Resolving full dependency tree (npm --package-lock-only)...`);
-  const resolveCode = await runNpmSilent(['install', ...allPinned, ...flags, '--package-lock-only']);
-  if (resolveCode !== 0) {
-    // Restore both files on resolution failure
-    if (lockBackup) fs.writeFileSync(lockPath, lockBackup);
-    else if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
-    if (pkgBackup) fs.writeFileSync(pkgPath, pkgBackup);
-    process.exit(resolveCode);
+  if (isGlobal) {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'safe-npm-global-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'safe-npm-audit-tmp', version: '1.0.0', private: true })
+    );
+    lockPath = path.join(tmpDir, 'package-lock.json');
+
+    console.log(`\n[safe-npm] Resolving full dependency tree in temp dir...`);
+    const resolveCode = await runNpmSilentInDir(tmpDir, ['install', ...allPinned, ...flags, '--package-lock-only']);
+    if (resolveCode !== 0) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      process.exit(resolveCode);
+    }
+  } else {
+    const pkgPath = path.join(process.cwd(), 'package.json');
+    lockPath  = path.join(process.cwd(), 'package-lock.json');
+    lockBackup = fs.existsSync(lockPath) ? fs.readFileSync(lockPath) : null;
+    pkgBackup  = fs.existsSync(pkgPath)  ? fs.readFileSync(pkgPath)  : null;
+
+    console.log(`\n[safe-npm] Resolving full dependency tree (npm --package-lock-only)...`);
+    const resolveCode = await runNpmSilent(['install', ...allPinned, ...flags, '--package-lock-only']);
+    if (resolveCode !== 0) {
+      if (lockBackup) fs.writeFileSync(lockPath, lockBackup);
+      else if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+      if (pkgBackup) fs.writeFileSync(path.join(process.cwd(), 'package.json'), pkgBackup);
+      process.exit(resolveCode);
+    }
   }
 
   // ── Phase 3: Audit the lockfile npm just wrote ───────────────────────────────
@@ -479,10 +561,14 @@ async function handleInstallWithPackages(pkgArgs, flags) {
   const unsafe = await auditPackageList(allLockPkgs);
 
   if (unsafe.length > 0) {
-    // Restore both files to pre-resolution state
-    if (lockBackup) fs.writeFileSync(lockPath, lockBackup);
-    else if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
-    if (pkgBackup) fs.writeFileSync(pkgPath, pkgBackup);
+    if (tmpDir) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } else {
+      const pkgPath = path.join(process.cwd(), 'package.json');
+      if (lockBackup) fs.writeFileSync(lockPath, lockBackup);
+      else if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+      if (pkgBackup) fs.writeFileSync(pkgPath, pkgBackup);
+    }
 
     console.error(`\n[safe-npm] ❌  Lockfile audit found ${unsafe.length} unsafe package(s):\n`);
     for (const p of unsafe) {
@@ -492,11 +578,18 @@ async function handleInstallWithPackages(pkgArgs, flags) {
     process.exit(1);
   }
 
-  // ── Phase 4: Actual install — lockfile + package.json already written correctly.
-  // Run `npm install` (no args) so npm installs from the existing lockfile
-  // without re-resolving (which could re-introduce unsafe versions).
+  // ── Phase 4: Actual install ──────────────────────────────────────────────────
   console.log(`[safe-npm] ✅  All ${allLockPkgs.length} packages passed. Installing...\n`);
-  await runNpm(['install']);
+  if (isGlobal) {
+    // Temp dir no longer needed — clean up before the real install
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    // Install all audited pins (top-level + transitive) globally so npm can't
+    // re-resolve transitives to a newer unsafe version (no lockfile to enforce them).
+    await runNpm(['install', '-g', ...allPinned, ...flags]);
+  } else {
+    // lockfile + package.json already written correctly — install from lockfile
+    await runNpm(['install', ...flags]);
+  }
 }
 
 /**
@@ -554,6 +647,7 @@ async function handleUpdate(pkgArgs, flags) {
 
   let targets;
   if (pkgArgs.length > 0) {
+    // Explicit packages: update them in all selected workspaces using their declared ranges.
     targets = pkgArgs.map(p => ({ name: p, range: allDeps[p] || '*' }));
   } else {
     targets = Object.entries(allDeps).map(([name, range]) => ({ name, range }));
@@ -631,7 +725,7 @@ async function handleUpdate(pkgArgs, flags) {
   }
 
   console.log(`[safe-npm] ✅  All ${allPkgs.length} packages passed. Installing updates...\n`);
-  await runNpm(['install']);
+  await runNpm(['install', ...flags]);
 }
 
 /**
@@ -666,8 +760,49 @@ async function handleCi() {
 // ─── safe-npx handler ─────────────────────────────────────────────────────────
 
 /**
- * safe-npx <pkg>[@range] [args...]
- * Finds the latest safe version of the package, then runs it via npx.
+ * Audit a single npx package specifier (used for both positional and -p/--package values).
+ * Returns the pinned specifier (e.g. "pkg@1.2.3") or exits on block.
+ */
+async function auditNpxSpec(spec) {
+  const { name, range } = parsePackageArg(spec);
+  const info      = await fetchPackageInfo(name);
+  const latest    = info['dist-tags']?.latest;
+  const safeVer   = findSafeVersion(info, range);
+  const safeCount = countSafeVersions(info);
+  const total     = Object.keys(info.versions || {}).filter(v => semver.valid(v) && !semver.prerelease(v)).length;
+
+  if (!safeVer) {
+    console.error(`❌  ${name}: no safe version (${safeCount}/${total} versions >${SAFE_AGE_DAYS}d old)`);
+    console.error(`\n[safe-npx] ❌  Blocked. Use --unsafe to bypass.\n`);
+    process.exit(1);
+  }
+
+  const publishDate = new Date(info.time[safeVer]).toISOString().slice(0, 10);
+  const downgraded  = latest && safeVer !== latest;
+
+  if (downgraded) {
+    const skipped = Object.keys(info.versions || {})
+      .filter(v => semver.valid(v) && !semver.prerelease(v))
+      .filter(v => info.time[v] && new Date(info.time[v]) >= CUTOFF)
+      .filter(v => semver.gt(v, safeVer))
+      .sort(semver.compare)
+      .map(v => `${v} (${new Date(info.time[v]).toISOString().slice(0, 10)}, ${daysAgo(info.time[v])}d old)`);
+    console.log(`⬇️   ${name}: ${latest} too new → ${safeVer} (${publishDate})`);
+    if (skipped.length) console.log(`     🚫 skipped (too new): ${skipped.join(', ')}`);
+    console.log(`     📌 pinned: ${name}@${safeVer}`);
+  } else {
+    console.log(`✅  ${name}@${safeVer} (${publishDate}) — safe`);
+  }
+  return `${name}@${safeVer}`;
+}
+
+/**
+ * safe-npx [flags] <pkg>[@range] [args...]
+ * safe-npx -p <pkg> [-p <pkg>...] [-c <cmd>] [args...]
+ *
+ * Audits:
+ *  - packages specified via -p/--package flags (when present)
+ *  - the first positional argument (when -p is absent)
  */
 async function mainNpx() {
   // Recursion guard
@@ -695,73 +830,63 @@ async function mainNpx() {
     return;
   }
 
-  // npx flags that consume the next argument (not the package specifier)
-  const VALUE_FLAGS = new Set(['-p', '--package', '-c', '--call', '--shell-auto-fallback', '--userconfig', '--npmPath']);
+  // npx flags that consume the next argument as a value (not a package specifier)
+  const EXEC_VALUE_FLAGS = new Set(['-c', '--call', '--shell-auto-fallback', '--userconfig', '--npmPath']);
 
-  // Find the package specifier: first non-flag arg (accounting for value-flags)
-  let pkgIdx = -1;
+  // ── Collect packages from -p/--package flags and/or the positional arg ──────
+  // -p pkg: the package to install+run (when present, positional is the binary name, not a package)
+  // No -p:  the first positional arg is both the package and the binary name
+  const pkgFlagEntries = [];  // { argIdx, spec } for each -p/--package value
+  let positionalIdx = -1;
+
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--') { pkgIdx = i + 1; break; }
-    if (VALUE_FLAGS.has(a)) { i++; continue; }  // skip flag + its value
-    if (!a.startsWith('-')) { pkgIdx = i; break; }
+    if (a === '--') { if (pkgFlagEntries.length === 0 && positionalIdx === -1 && i + 1 < argv.length) positionalIdx = i + 1; break; }
+    if (a === '-p' || a === '--package') {
+      if (i + 1 < argv.length) { pkgFlagEntries.push({ argIdx: i + 1, spec: argv[i + 1] }); i++; }
+      continue;
+    }
+    if (a.startsWith('--package=')) {
+      pkgFlagEntries.push({ argIdx: i, spec: a.slice('--package='.length), equalsForm: true });
+      continue;
+    }
+    if (EXEC_VALUE_FLAGS.has(a)) { i++; continue; }
+    // First non-flag arg: this is the positional package (or the command when -p is used).
+    // Everything after it are arguments to the executed command — stop scanning.
+    if (!a.startsWith('-')) { if (positionalIdx === -1) positionalIdx = i; break; }
   }
 
-  if (pkgIdx === -1 || pkgIdx >= argv.length) {
+  // Which specs to audit
+  const specsToAudit = pkgFlagEntries.length > 0
+    ? pkgFlagEntries
+    : (positionalIdx >= 0 ? [{ argIdx: positionalIdx, spec: argv[positionalIdx] }] : []);
+
+  if (specsToAudit.length === 0) {
     await runNpx(argv);
     return;
   }
 
-  const pkgSpecifier = argv[pkgIdx];
+  // Local paths and URLs pass through without age check
+  const allLocal = specsToAudit.every(({ spec }) =>
+    spec.startsWith('.') || spec.startsWith('/') || spec.includes('://'));
+  if (allLocal) { await runNpx(argv); return; }
 
-  // Local paths, URLs, or already-pinned exact versions → pass through
-  if (pkgSpecifier.startsWith('.') || pkgSpecifier.startsWith('/') || pkgSpecifier.includes('://')) {
-    await runNpx(argv);
-    return;
-  }
+  console.log(`\n[safe-npx] Checking ${specsToAudit.length} package(s) — only versions >${SAFE_AGE_DAYS} days old allowed\n`);
 
-  const { name, range } = parsePackageArg(pkgSpecifier);
-  console.log(`\n[safe-npx] Checking ${name} — only versions >${SAFE_AGE_DAYS} days old allowed\n`);
-
+  const newArgv = [...argv];
   try {
-    const info      = await fetchPackageInfo(name);
-    const latest    = info['dist-tags']?.latest;
-    const safeVer   = findSafeVersion(info, range);
-    const safeCount = countSafeVersions(info);
-    const total     = Object.keys(info.versions || {}).filter(v => semver.valid(v) && !semver.prerelease(v)).length;
-
-    if (!safeVer) {
-      console.error(`❌  ${name}: no safe version (${safeCount}/${total} versions >${SAFE_AGE_DAYS}d old)`);
-      console.error(`\n[safe-npx] ❌  Blocked. Use --unsafe to bypass.\n`);
-      process.exit(1);
+    for (const { argIdx, spec, equalsForm } of specsToAudit) {
+      if (spec.startsWith('.') || spec.startsWith('/') || spec.includes('://')) continue;
+      const pinned = await auditNpxSpec(spec);
+      newArgv[argIdx] = equalsForm ? `--package=${pinned}` : pinned;
     }
-
-    const publishDate = new Date(info.time[safeVer]).toISOString().slice(0, 10);
-    const downgraded  = latest && safeVer !== latest;
-
-    if (downgraded) {
-      const skipped = Object.keys(info.versions || {})
-        .filter(v => semver.valid(v) && !semver.prerelease(v))
-        .filter(v => info.time[v] && new Date(info.time[v]) >= CUTOFF)
-        .filter(v => semver.gt(v, safeVer))
-        .sort(semver.compare)
-        .map(v => `${v} (${new Date(info.time[v]).toISOString().slice(0, 10)}, ${daysAgo(info.time[v])}d old)`);
-      console.log(`⬇️   ${name}: ${latest} too new → ${safeVer} (${publishDate})`);
-      if (skipped.length) console.log(`     🚫 skipped (too new): ${skipped.join(', ')}`);
-      console.log(`     📌 pinned: ${name}@${safeVer}`);
-    } else {
-      console.log(`✅  ${name}@${safeVer} (${publishDate}) — safe`);
-    }
-
-    const newArgv = [...argv];
-    newArgv[pkgIdx] = `${name}@${safeVer}`;
-    console.log(`\n[safe-npx] Running: npx ${newArgv.join(' ')}\n`);
-    await runNpx(newArgv);
-
   } catch (e) {
     console.error(`[safe-npx] Error: ${e.message}`);
     process.exit(1);
   }
+
+  console.log(`\n[safe-npx] Running: npx ${newArgv.join(' ')}\n`);
+  await runNpx(newArgv);
 }
 
 // ─── Disable / enable / status ────────────────────────────────────────────────
@@ -826,18 +951,63 @@ async function main() {
     return;
   }
 
-  if (INSTALL_CMDS.has(cmd)) {
-    const flags   = rest.filter(isFlag);
-    const pkgArgs = rest.filter(a => !isFlag(a));
-    if (pkgArgs.length > 0) {
-      await handleInstallWithPackages(pkgArgs, flags);
-    } else {
-      await handleInstallNoPackages(flags);
+  if (INSTALL_CMDS.has(cmd) || UPDATE_CMDS.has(cmd)) {
+    const { flags, pkgArgs } = splitFlagsAndPkgs(rest);
+
+    // Workspace and prefix installs are not yet supported — guard early.
+    const WS_FLAGS = new Set(['--workspace', '-w', '--workspaces', '--ws', '-ws', '--prefix']);
+    const hasWsFlag = flags.some(f =>
+      WS_FLAGS.has(f) ||
+      f.startsWith('--workspace=') || f.startsWith('--prefix=') ||
+      f.startsWith('--workspaces=') || f.startsWith('--ws='));
+    if (hasWsFlag) {
+      console.error('[safe-npm] ❌  Workspace and --prefix installs are not yet supported by safe-npm.\n' +
+                    '           Use --unsafe to bypass safety checks, or run npm directly.\n');
+      process.exit(1);
     }
-  } else if (UPDATE_CMDS.has(cmd)) {
-    const flags   = rest.filter(isFlag);
-    const pkgArgs = rest.filter(a => !isFlag(a));
-    await handleUpdate(pkgArgs, flags);
+
+    // Flags that can override the registry or resolution source are blocked — safe-npm
+    // only audits against registry.npmjs.org and can't inspect custom config files.
+    const hasUnsupportedFlag = flags.some(f =>
+      f === '--registry'    || f.startsWith('--registry=') ||
+      f === '--tag'         || f.startsWith('--tag=') ||
+      f === '--userconfig'  || f.startsWith('--userconfig=') ||
+      f === '--globalconfig'|| f.startsWith('--globalconfig='));
+    if (hasUnsupportedFlag) {
+      console.error('[safe-npm] ❌  Flags that can override the registry are not supported by safe-npm\n' +
+                    '           (--registry, --tag, --userconfig, --globalconfig).\n' +
+                    '           Use --unsafe to bypass safety checks, or run npm directly.\n');
+      process.exit(1);
+    }
+
+    // Detect global install flags (-g / --global / --location=global).
+    // Strip them from flags passed to the handler; the handler adds -g back for Phase 4.
+    const { isGlobal, strippedFlags } = extractGlobalFlag(flags);
+    const effectiveFlags = isGlobal ? strippedFlags : flags;
+
+    if (INSTALL_CMDS.has(cmd)) {
+      if (pkgArgs.length > 0) {
+        await handleInstallWithPackages(pkgArgs, effectiveFlags, { isGlobal });
+      } else if (isGlobal) {
+        // `npm install -g` with no packages would globally install the current project.
+        // handleInstallNoPackages uses --package-lock-only which npm ignores for global
+        // installs, so it would perform the real install before any audit. Block for now.
+        console.error('[safe-npm] ❌  Global install with no packages (npm install -g) is not yet supported by safe-npm.\n' +
+                      '           Specify the package(s) to install: safe-npm install -g <pkg...>\n' +
+                      '           Use --unsafe to bypass safety checks, or run npm directly.\n');
+        process.exit(1);
+      } else {
+        await handleInstallNoPackages(effectiveFlags);
+      }
+    } else {
+      // Global updates not yet supported — block early rather than silently operating locally.
+      if (isGlobal) {
+        console.error('[safe-npm] ❌  Global updates (npm update -g) are not yet supported by safe-npm.\n' +
+                      '           Use --unsafe to bypass safety checks, or run npm directly.\n');
+        process.exit(1);
+      }
+      await handleUpdate(pkgArgs, effectiveFlags);
+    }
   } else if (cmd === 'ci') {
     await handleCi();
   } else {
