@@ -426,6 +426,8 @@ def load_requirements(path: str) -> list[Requirement]:
         for line in f:
             r = parse_req_line(line)
             if r:
+                if r.marker and not r.marker.evaluate():
+                    continue
                 reqs.append(r)
     return reqs
 
@@ -663,9 +665,16 @@ def handle_requirements(req_file: str, flags: list[str], upgrade: bool) -> None:
 
     # Install with pinned safe versions instead of raw requirements.txt
     # (the original file's ranges could still resolve to unsafe versions)
-    pinned = [f"{r['name']}=={r['safe_ver']}" for r in
-              (results[req.name] for req in reqs) if r.get("safe_ver")]
+    pinned = []
+    for req in reqs:
+        r = results[req.name]
+        if r.get("safe_ver"):
+            extras = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
+            pinned.append(f"{r['name']}{extras}=={r['safe_ver']}")
     install_flags = ["--upgrade"] if upgrade else []
+
+    top_level_names = {req.name.lower() for req in reqs}
+    pinned = _check_transitives(pinned, top_level_names, install_flags, flags)
 
     print(f"\n[safe-pip] Running: pip install {' '.join(pinned)}\n")
     run_real_pip(["install"] + install_flags + pinned + flags)
