@@ -11,7 +11,11 @@ warn()  { echo -e "${YELLOW}[safe-pip]${NC} $*"; }
 error() { echo -e "${RED}[safe-pip]${NC} $*" >&2; exit 1; }
 
 WRAP_PIP=false
-for arg in "$@"; do [[ "$arg" == "--pip-wrapper" ]] && WRAP_PIP=true; done
+VENV_HOOK=false
+for arg in "$@"; do
+  [[ "$arg" == "--pip-wrapper" ]] && WRAP_PIP=true
+  [[ "$arg" == "--venv-hook"   ]] && VENV_HOOK=true
+done
 
 # ─── Prerequisites ────────────────────────────────────────────────────────────
 
@@ -124,6 +128,82 @@ if command -v pyenv &>/dev/null; then
   info "Future 'pyenv install X.Y.Z' will auto-configure safe-pip."
 fi
 
+# ─── Venv hook (--venv-hook) ──────────────────────────────────────────────────
+
+_install_venv_hook() {
+  # ── Fish shell ──────────────────────────────────────────────────────────────
+  local fish_fn_dir="$HOME/.config/fish/functions"
+  if command -v fish &>/dev/null || [[ -d "$fish_fn_dir" ]]; then
+    mkdir -p "$fish_fn_dir"
+
+    # pip / pip3: when inside a venv, route through safe-pip.
+    # Outside a venv the --pip-wrapper binary (or system pip) is used as usual.
+    for cmd in pip pip3; do
+      cat > "$fish_fn_dir/$cmd.fish" << FISHFN
+function $cmd --wraps=$cmd --description 'safe-pip venv wrapper'
+    if set -q VIRTUAL_ENV; and test -f ~/.safe-pip/safe-pip.py
+        python ~/.safe-pip/safe-pip.py \$argv
+    else
+        command $cmd \$argv
+    end
+end
+FISHFN
+      info "Installed fish venv hook: $fish_fn_dir/$cmd.fish"
+    done
+
+    # safe-venv: create a venv then immediately inject safe-pip into it.
+    cat > "$fish_fn_dir/safe-venv.fish" << 'SAFEVENV'
+function safe-venv --wraps='python -m venv' --description 'Create venv and inject safe-pip'
+    python -m venv $argv
+    or return $status
+    # Last positional arg (non-flag) is the venv directory
+    set -l venv_dir
+    for arg in $argv
+        if not string match -q -- '-*' $arg
+            set venv_dir $arg
+        end
+    end
+    if test -n "$venv_dir"; and test -d "$venv_dir"
+        safe-pip inject-venv "$venv_dir"
+    end
+end
+SAFEVENV
+    info "Installed fish function: $fish_fn_dir/safe-venv.fish"
+  fi
+
+  # ── Bash / Zsh ──────────────────────────────────────────────────────────────
+  local _snippet
+  _snippet='
+# safe-pip venv hook — added by safe-pip install.sh
+_safe_pip_venv_wrap() {
+  local _cmd="$1"; shift
+  if [ -n "$VIRTUAL_ENV" ] && [ -f "$HOME/.safe-pip/safe-pip.py" ]; then
+    python "$HOME/.safe-pip/safe-pip.py" "$@"
+  else
+    command "$_cmd" "$@"
+  fi
+}
+pip()  { _safe_pip_venv_wrap pip  "$@"; }
+pip3() { _safe_pip_venv_wrap pip3 "$@"; }
+safe-venv() {
+  python -m venv "$@" || return $?
+  local d
+  for a in "$@"; do [[ "$a" != -* ]] && d="$a"; done
+  [[ -n "$d" && -d "$d" ]] && safe-pip inject-venv "$d"
+}'
+
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [[ -f "$rc" ]] && ! grep -q "safe-pip venv hook" "$rc" 2>/dev/null; then
+      printf '%s\n' "$_snippet" >> "$rc"
+      info "Installed venv hook → $rc"
+    fi
+  done
+}
+
+if [[ "$VENV_HOOK" == "true" ]]; then
+  _install_venv_hook
+fi
+
 # ─── PATH check ───────────────────────────────────────────────────────────────
 
 if echo "$PATH" | tr ':' '\n' | grep -qxF "$BIN_DIR"; then
@@ -146,5 +226,17 @@ if [[ "$WRAP_PIP" == "true" ]]; then
   echo "  so it works correctly with pyenv — no recursion, no version confusion."
 else
   echo "  To also replace pip / pip3, re-run with: bash install.sh --pip-wrapper"
+  echo ""
+fi
+
+if [[ "$VENV_HOOK" == "true" ]]; then
+  info "Venv hooks installed."
+  echo ""
+  echo "  • pip / pip3 inside any activated venv → routed through safe-pip"
+  echo "  • safe-venv <dir>  — creates a venv and auto-injects safe-pip into it"
+  echo "  • safe-pip inject-venv <dir>  — inject into an existing venv manually"
+  echo ""
+else
+  echo "  To also protect pip inside virtual envs, re-run with: bash install.sh --venv-hook"
   echo ""
 fi

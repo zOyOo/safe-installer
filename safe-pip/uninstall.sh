@@ -50,6 +50,26 @@ if command -v pyenv &>/dev/null; then
   fi
 fi
 
+# ─── Remove venv hooks (--venv-hook) ─────────────────────────────────────────
+
+# Fish function files
+for fn in pip pip3 safe-venv; do
+  f="$HOME/.config/fish/functions/$fn.fish"
+  if [[ -f "$f" ]] && grep -q 'safe-pip' "$f" 2>/dev/null; then
+    rm -f "$f"
+    info "Removed fish function: $f"
+  fi
+done
+
+# Bash / Zsh rc files
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  if [[ -f "$rc" ]] && grep -q 'safe-pip venv hook' "$rc" 2>/dev/null; then
+    # Remove the block from the marker line to the closing brace of safe-venv()
+    perl -i -0pe 's/\n# safe-pip venv hook.*?^}\n//ms' "$rc" 2>/dev/null || true
+    info "Removed venv hook block from $rc"
+  fi
+done
+
 # ─── Remove wrapper binaries ──────────────────────────────────────────────────
 
 for cmd in safe-pip pip pip3; do

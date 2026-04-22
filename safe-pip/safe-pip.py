@@ -686,6 +686,80 @@ INSTALL_DIR = os.path.expanduser("~/.safe-pip")
 DISABLED_FLAG = os.path.join(INSTALL_DIR, "disabled")
 
 
+def _cmd_inject_venv(venv_path: str) -> None:
+    """Install safe-pip wrappers into an existing venv directory."""
+    import shutil, stat
+
+    venv_path = os.path.abspath(venv_path)
+    if not os.path.isdir(venv_path):
+        print(f"[safe-pip] ❌  Not a directory: {venv_path}", file=sys.stderr)
+        sys.exit(1)
+
+    safe_pip_script = os.path.abspath(__file__)
+
+    # Find Python executable inside the venv
+    venv_python = None
+    for name in ("python3", "python"):
+        p = os.path.join(venv_path, "bin", name)
+        if os.path.isfile(p) or os.path.islink(p):
+            venv_python = p  # keep as venv path, not resolved base interpreter
+            break
+    if not venv_python or not os.path.exists(venv_python):
+        print(f"[safe-pip] ❌  No Python executable found in {venv_path}/bin/", file=sys.stderr)
+        sys.exit(1)
+
+    # Replace all pip/pip3/pip3.X binaries with safe-pip wrappers
+    bin_dir = os.path.join(venv_path, "bin")
+    for entry in sorted(os.listdir(bin_dir)):
+        if entry == "pip" or (entry.startswith("pip3") and (len(entry) == 4 or entry[4] in (".", ""))):
+            pip_path = os.path.join(bin_dir, entry)
+            if not os.path.isfile(pip_path) and not os.path.islink(pip_path):
+                continue
+            with open(pip_path, "w") as f:
+                f.write(f'#!/bin/sh\nexec "{venv_python}" "{safe_pip_script}" "$@"\n')
+            os.chmod(pip_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+            print(f"[safe-pip]   Wrapped: {pip_path}")
+
+    # Install sitecustomize.py into the venv's site-packages so `python -m pip`
+    # is also intercepted.  site-packages are added to sys.path *before*
+    # sitecustomize is imported, so this location is reliably found.
+    result = subprocess.run(
+        [venv_python, "-c", "import site; print(site.getsitepackages()[0])"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        site_pkgs = result.stdout.strip()
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usercustomize.py")
+        if not os.path.exists(src):
+            src = os.path.join(INSTALL_DIR, "usercustomize.py")
+        if not os.path.exists(src):
+            print("[safe-pip] ⚠️   usercustomize.py not found — sitecustomize hook skipped.\n"
+                  "           Run 'safe-pip inject-venv' from the install directory or after\n"
+                  "           running install.sh so the source file is present.",
+                  file=sys.stderr)
+        elif site_pkgs and os.path.isdir(site_pkgs):
+            dst = os.path.join(site_pkgs, "sitecustomize.py")
+            existing = ""
+            if os.path.exists(dst):
+                with open(dst) as f:
+                    existing = f.read()
+            if "safe-pip usercustomize hook" in existing:
+                print(f"[safe-pip]   sitecustomize.py already present in {site_pkgs}")
+            elif existing:
+                # Append our hook so we don't clobber project-level customisation
+                with open(dst, "a") as f:
+                    f.write("\n")
+                    with open(src) as s:
+                        f.write(s.read())
+                print(f"[safe-pip]   Appended safe-pip hook to sitecustomize.py → {site_pkgs}")
+            else:
+                import shutil as _sh
+                _sh.copy2(src, dst)
+                print(f"[safe-pip]   Installed sitecustomize.py → {site_pkgs}")
+
+    print(f"\n[safe-pip] ✅  Injected into venv: {venv_path}")
+
+
 def _cmd_disable():
     os.makedirs(INSTALL_DIR, exist_ok=True)
     with open(DISABLED_FLAG, "w") as f:
@@ -718,6 +792,11 @@ def main():
         _cmd_enable(); return
     if args and args[0] == "status":
         _cmd_status(); return
+    if args and args[0] == "inject-venv":
+        if len(args) < 2:
+            print("[safe-pip] Usage: safe-pip inject-venv <venv-path>", file=sys.stderr)
+            sys.exit(1)
+        _cmd_inject_venv(args[1]); return
 
     # Sentinel file: disabled → pass everything straight to pip
     if os.path.exists(DISABLED_FLAG):
