@@ -10,8 +10,41 @@ const semver  = require('semver');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const SAFE_AGE_DAYS  = parseInt(process.env.SAFE_NPM_AGE_DAYS || '30', 10);
-const CUTOFF         = new Date(Date.now() - SAFE_AGE_DAYS * 24 * 60 * 60 * 1000);
+let SAFE_AGE_DAYS  = parseInt(process.env.SAFE_NPM_AGE_DAYS || '30', 10);
+let CUTOFF         = new Date(Date.now() - SAFE_AGE_DAYS * 24 * 60 * 60 * 1000);
+
+const MIN_AGE_DAYS = 2;
+
+/**
+ * Parse and strip --min-age=N or --min-age N from argv.
+ * Updates SAFE_AGE_DAYS and CUTOFF if the flag is present.
+ * Returns the argv with the flag removed.
+ */
+function applyMinAgeFlag(argv) {
+  const out = [];
+  let pastDashDash = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') { pastDashDash = true; out.push(a); continue; }
+    let val = null;
+    if (!pastDashDash && a.startsWith('--min-age=')) {
+      val = a.slice('--min-age='.length);
+    } else if (!pastDashDash && a === '--min-age' && i + 1 < argv.length) {
+      val = argv[++i];
+    } else {
+      out.push(a);
+      continue;
+    }
+    const n = parseInt(val, 10);
+    if (!Number.isInteger(n) || n < MIN_AGE_DAYS) {
+      console.error(`[safe-npm] ❌  --min-age must be an integer >= ${MIN_AGE_DAYS} (got: ${val})`);
+      process.exit(1);
+    }
+    SAFE_AGE_DAYS = n;
+    CUTOFF = new Date(Date.now() - n * 24 * 60 * 60 * 1000);
+  }
+  return out;
+}
 const INSTALL_DIR    = path.join(process.env.HOME || process.env.USERPROFILE, '.safe-npm');
 const DISABLED_FLAG  = path.join(INSTALL_DIR, 'disabled');
 
@@ -818,7 +851,7 @@ async function mainNpx() {
     return;
   }
 
-  const argv = process.argv.slice(2);
+  const argv = applyMinAgeFlag(process.argv.slice(2));
 
   // Built-in management subcommands (shared with safe-npm)
   if (argv[0] === 'disable') { cmdDisable(); return; }
@@ -915,8 +948,9 @@ function cmdEnable() {
 
 function cmdStatus() {
   const disabled = fs.existsSync(DISABLED_FLAG);
+  const ageSource = process.env.SAFE_NPM_AGE_DAYS ? 'SAFE_NPM_AGE_DAYS' : 'default';
   console.log(`[safe-npm] Status: ${disabled ? '🔴 DISABLED' : '🟢 ENABLED'}`);
-  console.log(`           Age threshold: ${SAFE_AGE_DAYS} days (SAFE_NPM_AGE_DAYS)`);
+  console.log(`           Age threshold: ${SAFE_AGE_DAYS} days (${ageSource}; override with --min-age, min ${MIN_AGE_DAYS})`);
   console.log(`           Real npm:      ${REAL_NPM}`);
 }
 
@@ -930,7 +964,7 @@ async function main() {
     return;
   }
 
-  const argv = process.argv.slice(2);
+  const argv = applyMinAgeFlag(process.argv.slice(2));
 
   if (argv.length === 0) {
     await runNpm([]);
