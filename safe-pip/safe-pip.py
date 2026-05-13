@@ -492,6 +492,9 @@ def _check_local_deps(local_args: list[str], install_flags: list[str], flags: li
             safe, pub_date = is_version_safe(info, ver)
             return {"name": name, "ver": ver, "safe": safe, "pub_date": pub_date}
         except Exception as e:
+            # KB-3: catches all exceptions including network errors/timeouts, not just
+            # 404s. A transient PyPI outage will pass the dep through unchecked.
+            # Only HTTP 404 should mean "private package — allow"; other errors should block.
             return {"name": name, "ver": ver, "error": str(e)}
 
     results = {}

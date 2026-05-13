@@ -397,7 +397,13 @@ def check_formula(name: str, is_cask: bool = False) -> dict:
 def _raw_url_for(
     repo: str, path: str, history: list[tuple[str, str, datetime, str]], version: str
 ) -> str | None:
-    """Return the raw GitHub URL for `version` using bump_sha (always has the formula file)."""
+    """Return the raw GitHub URL for `version` using bump_sha (always has the formula file).
+
+    KB-2: Uses bump_sha rather than newest_sha, so post-bump formula fixes
+    (checksum, URL, dep patches) that are now older than CUTOFF are not included.
+    newest_sha is not safe for URL construction — it can be a rename commit where
+    the file has already moved to a different path.
+    """
     bump_sha = next((b for v, _, _, b in history if _version_matches(version, v)), None)
     return f"https://raw.githubusercontent.com/{repo}/{bump_sha}/{path}" if bump_sha else None
 
@@ -506,6 +512,10 @@ def _fetch_raw_formula(url: str, name: str) -> bytes:
     (Formula/<n>/<name>.rb) in early 2021. The GitHub commits API follows
     renames, so a SHA returned for a path query may have the file at the
     *other* layout. We try both before giving up.
+
+    KB-1: lib* formulas scanned under Formula/lib/<name>.rb are not covered
+    by this retry — if the pinned SHA predates that directory, the download
+    will 404 without attempting the flat or first-letter fallback.
     """
     flat = f"Formula/{name}.rb"
     sharded = f"Formula/{name[0]}/{name}.rb"
