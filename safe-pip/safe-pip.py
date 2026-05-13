@@ -532,9 +532,9 @@ def _check_local_deps(local_args: list[str], install_flags: list[str], flags: li
             print(f"✅  {name}=={ver}{date_str} — dep safe")
         elif r.get("safe_ver"):
             resolved = r.get("resolved_ver", ver)
-            print(f"⬇️   {name} (local dep): {resolved} too new → {r['safe_ver']} ({r['pub_date']})")
-            print(f"     📌 pinned:  {name}=={r['safe_ver']}")
-            pinned.append(f"{name}=={r['safe_ver']}")
+            print(f"⬇️   {name} (local dep): {resolved} too new → <={r['safe_ver']} ({r['pub_date']})")
+            print(f"     📌 pinned:  {name}<={r['safe_ver']}")
+            pinned.append(f"{name}<={r['safe_ver']}")
         else:
             no_safe.append(f"{name}=={ver}")
             print(f"❌  {name}=={ver}: too new and no safe version found",
@@ -581,9 +581,9 @@ def _check_local_deps(local_args: list[str], install_flags: list[str], flags: li
             print(f"✅  {name}=={ver}{date_str} — dep safe")
         elif r.get("safe_ver"):
             resolved = r.get("resolved_ver", ver)
-            print(f"⬇️   {name} (transitive): {resolved} too new → {r['safe_ver']} ({r['pub_date']})")
-            print(f"     📌 pinned:  {name}=={r['safe_ver']}")
-            pinned.append(f"{name}=={r['safe_ver']}")
+            print(f"⬇️   {name} (transitive): {resolved} too new → <={r['safe_ver']} ({r['pub_date']})")
+            print(f"     📌 pinned:  {name}<={r['safe_ver']}")
+            pinned.append(f"{name}<={r['safe_ver']}")
         else:
             extra_no_safe.append(f"{name}=={ver}")
             print(f"❌  {name}=={ver}: too new and no safe version found", file=sys.stderr)
@@ -732,10 +732,10 @@ def _check_transitives(
     print(f"[safe-pip] Checking {len(transitive)} transitive dependenc{'y' if len(transitive)==1 else 'ies'}...\n")
     trans_results = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
-        # Check against "" (no specifier) so we always compare with the
-        # actual latest — this surfaces downgrades even when _resolve_via_pypi_metadata
-        # already returned the safe version.
-        futures = {ex.submit(check_package, name, ""): (name, ver)
+        # Use pip's resolved version as upper bound so we respect inter-dep
+        # constraints (e.g. aiobotocore==3.4.0 requires botocore<1.42.85,
+        # so we must not pin botocore higher than what pip's resolver chose).
+        futures = {ex.submit(check_package, name, f"<={ver}"): (name, ver)
                    for name, ver in transitive}
         for fut in as_completed(futures):
             name, ver = futures[fut]
@@ -752,14 +752,14 @@ def _check_transitives(
             trans_blocked = True
         elif r.get("downgraded"):
             print(f"⬇️   {name} (dep): {r['latest']} too new "
-                  f"→ {r['safe_ver']} ({r['pub_date']})")
+                  f"→ <={r['safe_ver']} ({r['pub_date']})")
             if r.get("skipped"):
                 _print_skipped(r["skipped"])
-            print(f"     📌 pinned:  {name}=={r['safe_ver']}")
-            trans_pinned.append(f"{name}=={r['safe_ver']}")
+            print(f"     📌 pinned:  {name}<={r['safe_ver']}")
+            trans_pinned.append(f"{name}<={r['safe_ver']}")
         else:
             print(f"✅  {name}=={r['safe_ver']} ({r['pub_date']}) — dep safe")
-            trans_pinned.append(f"{name}=={r['safe_ver']}")
+            trans_pinned.append(f"{name}<={r['safe_ver']}")
 
     if trans_blocked:
         print(
