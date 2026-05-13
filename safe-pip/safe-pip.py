@@ -12,6 +12,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import tempfile
 
 SAFE_AGE_DAYS = int(os.environ.get('SAFE_PIP_AGE_DAYS', '30'))
 CUTOFF = datetime.now(timezone.utc) - timedelta(days=SAFE_AGE_DAYS)
@@ -477,53 +478,125 @@ def check_package(name: str, specifier: str = "") -> dict:
         return {"name": name, "specifier": specifier, "safe_ver": None, "error": str(e)}
 
 
-def _check_local_deps(local_args: list[str], install_flags: list[str], flags: list[str]) -> None:
-    """Age-check all deps that pip would install from local/editable packages."""
+def _constraint_flags(pins: list[str]) -> list[str]:
+    """Write pins to a temp constraints file and return ['-c', path], or [] if empty."""
+    if not pins:
+        return []
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, prefix="safe_pip_")
+    f.write("\n".join(pins) + "\n")
+    f.close()
+    return ["-c", f.name]
+
+
+def _check_local_deps(local_args: list[str], install_flags: list[str], flags: list[str]) -> list[str]:
+    """Age-check deps from local/editable packages; pin too-new ones to a safe version.
+
+    Returns a list of pinned constraint strings (e.g. ["requests==2.28.0"]) that
+    the caller should pass to pip so the resolved too-new versions are overridden.
+    """
     plan = resolve_install_plan(local_args, install_flags + flags)
     if not plan:
-        return
+        return []
 
     print(f"[safe-pip] Checking {len(plan)} dependenc{'y' if len(plan)==1 else 'ies'} "
           f"from local package(s)...\n")
 
-    def _check_ver(name: str, ver: str) -> dict:
+    def _check_one(name: str, ver: str) -> dict:
         try:
             info = fetch_pypi(name)
             safe, pub_date = is_version_safe(info, ver)
-            return {"name": name, "ver": ver, "safe": safe, "pub_date": pub_date}
+            if safe:
+                return {"name": name, "ver": ver, "safe": True, "pub_date": pub_date}
+            # Too new — find a safe downgrade (no specifier = search all versions)
+            r = check_package(name, "")
+            r["resolved_ver"] = ver  # original too-new version for display
+            return r
         except Exception as e:
-            # KB-3: catches all exceptions including network errors/timeouts, not just
-            # 404s. A transient PyPI outage will pass the dep through unchecked.
-            # Only HTTP 404 should mean "private package — allow"; other errors should block.
             return {"name": name, "ver": ver, "error": str(e)}
 
     results = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
-        futures = {ex.submit(_check_ver, name, ver): (name, ver) for name, ver in plan}
+        futures = {ex.submit(_check_one, name, ver): (name, ver) for name, ver in plan}
         for fut in as_completed(futures):
             name, ver = futures[fut]
             results[(name, ver)] = fut.result()
 
-    blocked = False
+    pinned: list[str] = []
+    no_safe: list[str] = []
     for name, ver in plan:
         r = results[(name, ver)]
         if "error" in r:
             print(f"✅  {name}=={ver} (not on PyPI — passing through)")
-        elif r["safe"]:
+        elif r.get("safe"):
             date_str = f" ({r['pub_date']})" if r.get("pub_date") else ""
             print(f"✅  {name}=={ver}{date_str} — dep safe")
+        elif r.get("safe_ver"):
+            resolved = r.get("resolved_ver", ver)
+            print(f"⬇️   {name} (local dep): {resolved} too new → {r['safe_ver']} ({r['pub_date']})")
+            print(f"     📌 pinned:  {name}=={r['safe_ver']}")
+            pinned.append(f"{name}=={r['safe_ver']}")
         else:
-            print(f"❌  {name}=={ver}: published {r.get('pub_date', '?')} — too new (local dep)",
+            no_safe.append(f"{name}=={ver}")
+            print(f"❌  {name}=={ver}: too new and no safe version found",
                   file=sys.stderr)
-            blocked = True
 
-    if blocked:
+    if no_safe:
         print(
-            f"\n[safe-pip] ❌  Install blocked: local package dep(s) are too new.\n"
+            f"\n[safe-pip] ❌  Install blocked: no safe version found for: {', '.join(no_safe)}\n"
             f"  Use --unsafe to bypass.\n",
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if not pinned:
+        return []
+
+    # Re-resolve with the downgrade constraints so we catch any transitive deps
+    # that the older pinned versions introduce but the original plan didn't include.
+    constraint_flags = _constraint_flags(pinned)
+    new_plan = resolve_install_plan(local_args + constraint_flags, install_flags + flags)
+    if new_plan is None:
+        return pinned
+
+    already_seen = {name.lower() for name, _ in plan}
+    new_deps = [(name, ver) for name, ver in new_plan if name.lower() not in already_seen]
+    if not new_deps:
+        return pinned
+
+    print(f"\n[safe-pip] Re-checking {len(new_deps)} new transitive dep(s) introduced by downgrade(s)...\n")
+    extra_results = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(_check_one, name, ver): (name, ver) for name, ver in new_deps}
+        for fut in as_completed(futures):
+            name, ver = futures[fut]
+            extra_results[(name, ver)] = fut.result()
+
+    extra_no_safe: list[str] = []
+    for name, ver in new_deps:
+        r = extra_results[(name, ver)]
+        if "error" in r:
+            print(f"✅  {name}=={ver} (not on PyPI — passing through)")
+        elif r.get("safe"):
+            date_str = f" ({r['pub_date']})" if r.get("pub_date") else ""
+            print(f"✅  {name}=={ver}{date_str} — dep safe")
+        elif r.get("safe_ver"):
+            resolved = r.get("resolved_ver", ver)
+            print(f"⬇️   {name} (transitive): {resolved} too new → {r['safe_ver']} ({r['pub_date']})")
+            print(f"     📌 pinned:  {name}=={r['safe_ver']}")
+            pinned.append(f"{name}=={r['safe_ver']}")
+        else:
+            extra_no_safe.append(f"{name}=={ver}")
+            print(f"❌  {name}=={ver}: too new and no safe version found", file=sys.stderr)
+
+    if extra_no_safe:
+        print(
+            f"\n[safe-pip] ❌  Install blocked: no safe version found for: {', '.join(extra_no_safe)}\n"
+            f"  Use --unsafe to bypass.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return pinned
 
 
 def handle_install(pkg_args: list[str], local_args: list[str], flags: list[str], upgrade: bool) -> None:
@@ -533,12 +606,15 @@ def handle_install(pkg_args: list[str], local_args: list[str], flags: list[str],
         run_real_pip(["install"] + flags)
         return
 
+    local_pins: list[str] = []
     if local_args:
-        _check_local_deps(local_args, install_flags, flags)
+        local_pins = _check_local_deps(local_args, install_flags, flags)
 
     if not pkg_args:
-        print(f"\n[safe-pip] Running: pip install {' '.join(local_args + flags)}\n")
-        run_real_pip(["install"] + install_flags + local_args + flags)
+        constraint_flags = _constraint_flags(local_pins)
+        cmd = local_args + constraint_flags + flags
+        print(f"\n[safe-pip] Running: pip install {' '.join(cmd)}\n")
+        run_real_pip(["install"] + install_flags + cmd)
         return
 
     print(f"\n[safe-pip] Checking {len(pkg_args)} package(s) — "
@@ -630,8 +706,10 @@ def handle_install(pkg_args: list[str], local_args: list[str], flags: list[str],
     top_level_names = {r["name"].lower() for r in results.values() if r.get("safe_ver")}
     all_pinned = _check_transitives(all_pinned, top_level_names, install_flags, flags)
 
-    print(f"\n[safe-pip] Running: pip install {' '.join(all_pinned + local_args + flags)}\n")
-    run_real_pip(["install"] + install_flags + all_pinned + local_args + flags)
+    constraint_flags = _constraint_flags(local_pins)
+    cmd = all_pinned + local_args + constraint_flags + flags
+    print(f"\n[safe-pip] Running: pip install {' '.join(cmd)}\n")
+    run_real_pip(["install"] + install_flags + cmd)
 
 
 def _check_transitives(

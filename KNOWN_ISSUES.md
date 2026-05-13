@@ -64,3 +64,40 @@ that exist on PyPI may be installed without an age check.
 
 **Fix sketch:** Distinguish `urllib.error.HTTPError` with `code == 404` from other
 exceptions in `_check_ver`; re-raise (or return a blocking result) for non-404 errors.
+
+---
+
+### [KB-4] Local dep downgrade ignores the local package's own version specifier
+
+**File:** `safe-pip/safe-pip.py` → `_check_local_deps` → `_check_one`
+
+When a resolved dependency is too new, `check_package(name, "")` searches for a safe
+version across all releases without considering the specifier that the local package
+actually declared (e.g. `foo>=2`). If no 2.x release is old enough, safe-pip will pin
+`foo==1.x`, causing a pip resolver conflict instead of a clear "no safe version satisfies
+the constraint" error.
+
+**Impact:** Install fails with a confusing pip resolver error rather than a safe-pip
+message. Not a silent bypass — the install is still blocked.
+
+**Fix sketch:** Extract the local package's `requires_dist` from PyPI metadata (or the
+local package itself), find the matching specifier for the dep being checked, and pass it
+to `check_package`.
+
+---
+
+### [KB-5] Post-downgrade re-resolution is not iterative
+
+**File:** `safe-pip/safe-pip.py` → `_check_local_deps`
+
+After pinning too-new local deps, the code re-resolves once to catch newly introduced
+transitive deps. But it only does one extra pass: if downgraded dep A introduces too-new
+B, and downgraded B introduces too-new C, C only appears after B's constraint is applied
+and never gets age-checked.
+
+**Impact:** In a 3+-level downgrade cascade, transitive deps introduced by the second
+(or later) downgrade are installed without an age check. Requires an unusual dependency
+graph; not seen in practice.
+
+**Fix sketch:** Loop `resolve_install_plan` + age-check until the pinned set stabilises
+(i.e. no new pins are added in a round).
