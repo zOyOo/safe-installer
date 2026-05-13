@@ -211,8 +211,11 @@ if echo "$PATH" | tr ':' '\n' | grep -qxF "$BIN_DIR"; then
 else
   warn "$BIN_DIR is not in PATH. Add it to your shell config:"
   echo ""
-  echo "  # bash / zsh:"
+  echo "  # bash:"
   echo "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.bashrc"
+  echo ""
+  echo "  # zsh:"
+  echo "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.zshrc"
   echo ""
   echo "  # fish:"
   echo "  fish_add_path $BIN_DIR"

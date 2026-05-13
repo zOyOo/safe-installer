@@ -157,6 +157,22 @@ def get_installed_brew_packages() -> set[str]:
     return installed
 
 
+def _get_outdated_names(is_cask: bool) -> list[str]:
+    """Return names of currently outdated formulas or casks."""
+    flag = "--cask" if is_cask else "--formula"
+    env = {**os.environ, "SAFE_BREW_ACTIVE": "1"}
+    try:
+        r = subprocess.run(
+            [_find_real_brew(), "outdated", flag, "--quiet"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        if r.returncode == 0:
+            return [line.strip().split()[0] for line in r.stdout.splitlines() if line.strip()]
+    except Exception:
+        pass
+    return []
+
+
 # ─── Version history via GitHub commits ──────────────────────────────────────
 
 def _extract_version_from_msg(name: str, first_line: str) -> str | None:
@@ -196,7 +212,13 @@ def scan_version_history(
         paths = [f"Casks/{name[0]}/{name}.rb", f"Casks/{name}.rb"]
     else:
         repo = "Homebrew/homebrew-core"
-        paths = [f"Formula/{name[0]}/{name}.rb", f"Formula/{name}.rb"]
+        # homebrew-core shards most formulas by first letter (Formula/l/foo.rb),
+        # but lib* formulas live in Formula/lib/ (not Formula/l/).
+        paths = []
+        if name.startswith("lib"):
+            paths.append(f"Formula/lib/{name}.rb")
+        paths.append(f"Formula/{name[0]}/{name}.rb")
+        paths.append(f"Formula/{name}.rb")
 
     for path in paths:
         history, newest_commit = _scan_path(repo, path, name)
@@ -207,8 +229,13 @@ def scan_version_history(
 
 def _scan_path(
     repo: str, path: str, name: str
-) -> tuple[list[tuple[str, str, datetime]], datetime | None]:
+) -> tuple[list[tuple[str, str, datetime, str]], datetime | None]:
     """Return (history, newest_file_commit_date).
+
+    Each history entry is (version, newest_sha, intro_date, bump_sha):
+      newest_sha — pending non-version-bump SHA if present; used for age detection
+      bump_sha   — the actual version-bump commit SHA; always has the formula file
+                   and is used for raw URL construction
 
     newest_file_commit_date is the date of the most recent commit that touched
     this file, regardless of whether its message matches the version pattern.
@@ -220,9 +247,10 @@ def _scan_path(
     if not commits or not isinstance(commits, list):
         return [], None
 
-    results: list[tuple[str, str, datetime]] = []
+    results: list[tuple[str, str, datetime, str]] = []
     current_ver: str | None = None
     current_newest_sha: str = ""
+    current_bump_sha: str = ""
     current_intro_date: datetime | None = None
     newest_file_commit_date: datetime | None = None
     pending_sha: str | None = None  # most-recent non-version-bump SHA, applied to next version block
@@ -245,28 +273,31 @@ def _scan_path(
         if ver is None:
             # Non-version-bump edit (checksum/URL/dep fix). Record the SHA so the
             # next version block picks it up as its newest_sha — it represents the
-            # most up-to-date state of that version. Works across all version
-            # boundaries (not just before the first version commit).
+            # most up-to-date state of that version for age-checking purposes.
+            # We do NOT use it for URL construction (the bump_sha is always valid).
             if pending_sha is None:
                 pending_sha = sha
             continue
 
         if current_ver is None:
             current_ver = ver
-            current_newest_sha = pending_sha or sha  # use fixup SHA if present
+            current_newest_sha = pending_sha or sha
+            current_bump_sha = sha  # version-bump commit always has the formula file
             current_intro_date = d
             pending_sha = None
         elif ver == current_ver:
             current_intro_date = d  # older commit → earlier intro date
+            current_bump_sha = sha  # keep earliest bump SHA (most stable for downloads)
         else:
-            results.append((current_ver, current_newest_sha, current_intro_date))  # type: ignore[arg-type]
+            results.append((current_ver, current_newest_sha, current_intro_date, current_bump_sha))  # type: ignore[arg-type]
             current_ver = ver
             current_newest_sha = pending_sha or sha
+            current_bump_sha = sha
             current_intro_date = d
             pending_sha = None
 
     if current_ver and current_intro_date:
-        results.append((current_ver, current_newest_sha, current_intro_date))
+        results.append((current_ver, current_newest_sha, current_intro_date, current_bump_sha))
 
     return results, newest_file_commit_date
 
@@ -326,7 +357,7 @@ def check_formula(name: str, is_cask: bool = False) -> dict:
 
     # Find current version's intro date
     intro_date: datetime | None = None
-    for hist_ver, _, hist_date in history:
+    for hist_ver, _, hist_date, _bump in history:
         if _version_matches(version, hist_ver):
             intro_date = hist_date
             break
@@ -348,7 +379,7 @@ def check_formula(name: str, is_cask: bool = False) -> dict:
         # re-resolving the dep to the current homebrew-core version).
         raw_url = _raw_url_for(repo, scanned_path, history, version)
         return {
-            "name": name, "is_cask": is_cask, "version": version,
+            "name": name, "canonical_name": canonical_name, "is_cask": is_cask, "version": version,
             "pub_date": intro_date.strftime("%Y-%m-%d"), "age_days": age_days,
             "safe": True, "raw_url": raw_url,
         }
@@ -356,7 +387,7 @@ def check_formula(name: str, is_cask: bool = False) -> dict:
     # Current version is too new — find the most recent safe fallback
     fallback = _find_fallback(repo, scanned_path, history, newest_commit)
     return {
-        "name": name, "is_cask": is_cask, "version": version,
+        "name": name, "canonical_name": canonical_name, "is_cask": is_cask, "version": version,
         "pub_date": intro_date.strftime("%Y-%m-%d"), "age_days": age_days,
         "safe": False,
         "fallback": fallback,  # (version, raw_url, intro_date) or None
@@ -364,15 +395,15 @@ def check_formula(name: str, is_cask: bool = False) -> dict:
 
 
 def _raw_url_for(
-    repo: str, path: str, history: list[tuple[str, str, datetime]], version: str
+    repo: str, path: str, history: list[tuple[str, str, datetime, str]], version: str
 ) -> str | None:
-    """Return the raw GitHub URL for `version` using the scanned path and newest_sha."""
-    sha = next((s for v, s, _ in history if _version_matches(version, v)), None)
-    return f"https://raw.githubusercontent.com/{repo}/{sha}/{path}" if sha else None
+    """Return the raw GitHub URL for `version` using bump_sha (always has the formula file)."""
+    bump_sha = next((b for v, _, _, b in history if _version_matches(version, v)), None)
+    return f"https://raw.githubusercontent.com/{repo}/{bump_sha}/{path}" if bump_sha else None
 
 
 def _find_fallback(
-    repo: str, path: str, history: list[tuple[str, str, datetime]],
+    repo: str, path: str, history: list[tuple[str, str, datetime, str]],
     newest_file_commit_date: datetime | None = None,
 ) -> tuple[str, str, datetime] | None:
     """Return (version, raw_url, intro_date) for the most recent safe version, or None.
@@ -382,13 +413,17 @@ def _find_fallback(
     we use max(intro_date, newest_file_commit_date) as the effective age so that
     a version whose newest_sha points at a recently-quarantined edit is not
     mistakenly returned as a safe fallback.
+
+    Raw URLs use bump_sha — the actual version-bump commit — which is guaranteed
+    to have the formula file, unlike pending_sha (which can be a rename/migration
+    commit where the file has already moved to a different path).
     """
-    for i, (hist_ver, newest_sha, intro_date) in enumerate(history):
+    for i, (hist_ver, newest_sha, intro_date, bump_sha) in enumerate(history):
         effective_date = intro_date
         if i == 0 and newest_file_commit_date and newest_file_commit_date > intro_date:
             effective_date = newest_file_commit_date
         if effective_date < CUTOFF:
-            raw_url = f"https://raw.githubusercontent.com/{repo}/{newest_sha}/{path}"
+            raw_url = f"https://raw.githubusercontent.com/{repo}/{bump_sha}/{path}"
             return (hist_ver, raw_url, intro_date)
     return None
 
@@ -437,6 +472,8 @@ def _install_casks_via_tap(
         subprocess.run(["git", "-C", tap_dir, "commit", "-q", "-m", "safe-brew pinned cask"],
                        capture_output=True, env=git_env)
 
+        subprocess.run([real_brew, "untap", tap_name], env=env, capture_output=True)
+
         tap_result = subprocess.run([real_brew, "tap", tap_name, tap_dir],
                                     env=env, capture_output=True, text=True)
         if tap_result.returncode != 0:
@@ -454,6 +491,127 @@ def _install_casks_via_tap(
 
     except Exception as e:
         print(f"\n[safe-brew] ❌  Failed to create temporary tap for cask pinning: {e}\n",
+              file=sys.stderr)
+        sys.exit(1)
+    finally:
+        shutil.rmtree(tap_dir, ignore_errors=True)
+
+
+# ─── Formula file downloader (path-layout aware) ─────────────────────────────
+
+def _fetch_raw_formula(url: str, name: str) -> bytes:
+    """Download a formula .rb file, retrying with the alternate path layout on 404.
+
+    homebrew-core migrated from flat (Formula/<name>.rb) to sharded
+    (Formula/<n>/<name>.rb) in early 2021. The GitHub commits API follows
+    renames, so a SHA returned for a path query may have the file at the
+    *other* layout. We try both before giving up.
+    """
+    flat = f"Formula/{name}.rb"
+    sharded = f"Formula/{name[0]}/{name}.rb"
+    if flat in url:
+        candidates = [url, url.replace(flat, sharded)]
+    elif sharded in url:
+        candidates = [url, url.replace(sharded, flat)]
+    else:
+        candidates = [url]
+
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            req = urllib.request.Request(candidate, headers={"User-Agent": "safe-brew/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                last_err = e
+                continue
+            raise
+    raise RuntimeError(
+        f"Formula file for '{name}' not found (tried: {candidates})"
+    ) from last_err
+
+
+# ─── Pinned formula installer (via temporary local tap) ──────────────────────
+
+def _install_formulas_via_tap(
+    top_name_targets: list[tuple[str, str]],
+    dep_pinned: list[tuple[str, str]],
+    flags: list[str],
+) -> None:
+    """Install pinned formulas via a temporary local tap.
+
+    Newer Homebrew removed support for brew install <url>.  We create a
+    minimal git repo, commit downloaded formula files into it, register it as
+    a local tap, install, then untap and delete.
+    """
+    tap_dir = tempfile.mkdtemp(prefix="safe-brew-tap-")
+    tap_name = "safe-brew/pinned"
+    real_brew = _find_real_brew()
+    env = {**os.environ, "SAFE_BREW_ACTIVE": "1"}
+
+    try:
+        formula_dir = os.path.join(tap_dir, "Formula")
+        os.makedirs(formula_dir)
+
+        top_targets: list[str] = []
+        dep_tap_targets: list[str] = []
+
+        for name, target in top_name_targets:
+            if target.startswith("https://"):
+                local = os.path.join(formula_dir, f"{name}.rb")
+                with open(local, "wb") as f:
+                    f.write(_fetch_raw_formula(target, name))
+                top_targets.append(f"{tap_name}/{name}")
+            else:
+                top_targets.append(target)
+
+        for name, url in dep_pinned:
+            local = os.path.join(formula_dir, f"{name}.rb")
+            with open(local, "wb") as f:
+                f.write(_fetch_raw_formula(url, name))
+            dep_tap_targets.append(f"{tap_name}/{name}")
+
+        git_env = {**os.environ,
+                   "GIT_AUTHOR_NAME": "safe-brew", "GIT_AUTHOR_EMAIL": "safe-brew@localhost",
+                   "GIT_COMMITTER_NAME": "safe-brew", "GIT_COMMITTER_EMAIL": "safe-brew@localhost"}
+        subprocess.run(["git", "init", "-q", tap_dir], capture_output=True, env=git_env)
+        subprocess.run(["git", "-C", tap_dir, "add", "."], capture_output=True, env=git_env)
+        subprocess.run(["git", "-C", tap_dir, "commit", "-q", "-m", "safe-brew pinned formulas"],
+                       capture_output=True, env=git_env)
+
+        # Remove any stale tap from a previous failed run before re-registering.
+        subprocess.run([real_brew, "untap", tap_name], env=env, capture_output=True)
+
+        tap_result = subprocess.run([real_brew, "tap", tap_name, tap_dir],
+                                    env=env, capture_output=True, text=True)
+        if tap_result.returncode != 0:
+            raise RuntimeError(f"brew tap failed: {tap_result.stderr.strip()}")
+
+        try:
+            if dep_tap_targets:
+                # Install pinned deps FIRST so they are already in the Cellar when
+                # the main formula's unqualified depends_on entries are resolved.
+                # If deps and the main formula are installed together, Homebrew
+                # resolves the unqualified dep names through the homebrew-core API
+                # (getting the latest version) and collides with our pinned version.
+                print(f"\n[safe-brew] Installing pinned dependencies first: "
+                      f"brew install {' '.join(dep_tap_targets + flags)}\n")
+                sys.stdout.flush()
+                r = subprocess.run([real_brew, "install"] + dep_tap_targets + flags, env=env)
+                if r.returncode != 0:
+                    sys.exit(r.returncode)
+
+            print(f"\n[safe-brew] Running: brew install {' '.join(top_targets + flags)}\n")
+            sys.stdout.flush()
+            result = subprocess.run([real_brew, "install"] + top_targets + flags, env=env)
+        finally:
+            subprocess.run([real_brew, "untap", tap_name], env=env, capture_output=True)
+
+        sys.exit(result.returncode)
+
+    except Exception as e:
+        print(f"\n[safe-brew] ❌  Failed to create temporary tap for formula pinning: {e}\n",
               file=sys.stderr)
         sys.exit(1)
     finally:
@@ -555,6 +713,8 @@ def handle_install(formulae: list[str], flags: list[str], is_cask: bool) -> None
         else:
             install_targets.append(name)  # may be promoted to raw_url later
 
+    dep_pinned: list[tuple[str, str]] = []  # (name, raw_url) for deps that need pinning
+
     # ── Resolve and check transitive dependencies ─────────────────────────────
     print(f"\n[safe-brew] Resolving dependencies...")
     try:
@@ -584,7 +744,6 @@ def handle_install(formulae: list[str], flags: list[str], is_cask: bool) -> None
                     key = futures2[fut]
                     dep_results[key] = fut.result()
 
-            dep_extra_targets: list[str] = []
             dep_blocked = False
             for n, c in new_deps:
                 r = dep_results[(n, c)]
@@ -592,7 +751,7 @@ def handle_install(formulae: list[str], flags: list[str], is_cask: bool) -> None
                     dep_blocked = True
                 elif not r.get("safe") and r.get("fallback"):
                     _, raw_url, _ = r["fallback"]
-                    dep_extra_targets.append(raw_url)
+                    dep_pinned.append((n, raw_url))
 
             if dep_blocked:
                 print(
@@ -608,7 +767,7 @@ def handle_install(formulae: list[str], flags: list[str], is_cask: bool) -> None
             # A safe parent's intro_date is always < CUTOFF < too-new dep intro_date
             # (by definition), so the safe version already predates the dep's update —
             # no further downgrade is needed, just an explicit URL.
-            if dep_extra_targets:
+            if dep_pinned:
                 install_targets = [
                     results[name].get("raw_url") or target
                     if (target == name)   # only promote the un-substituted ones
@@ -616,7 +775,7 @@ def handle_install(formulae: list[str], flags: list[str], is_cask: bool) -> None
                     for name, target in zip(formulae, install_targets)
                 ]
 
-            install_targets += dep_extra_targets
+            install_targets += [url for _, url in dep_pinned]
         else:
             print("[safe-brew] All dependencies already installed — skipping dep audit.")
 
@@ -645,9 +804,141 @@ def handle_install(formulae: list[str], flags: list[str], is_cask: bool) -> None
         _install_casks_via_tap(list(zip(formulae, top_targets)), dep_targets, flags)
         return  # _install_casks_via_tap calls sys.exit internally
 
+    if not effective_is_cask and any(t.startswith("https://") for t in install_targets):
+        # Newer Homebrew no longer supports brew install <url>; use a local tap instead.
+        # Use canonical names (e.g. python@3.14 for the alias python) so the .rb filename
+        # matches the Ruby class name that Homebrew expects when loading from a tap.
+        top_canonical = [
+            (results[name].get("canonical_name") or name, target)
+            for name, target in zip(formulae, top_targets)
+        ]
+        _install_formulas_via_tap(top_canonical, dep_pinned, flags)
+        return  # _install_formulas_via_tap calls sys.exit internally
+
     cask_flags = ["--cask"] if effective_is_cask else []
     print(f"\n[safe-brew] Running: brew install {' '.join(cask_flags + install_targets + flags)}\n")
     run_real_brew(["install"] + cask_flags + install_targets + flags)
+
+
+# ─── Upgrade handler ──────────────────────────────────────────────────────────
+
+def handle_upgrade(formulae: list[str], flags: list[str], is_cask: bool | None) -> None:
+    """Check upgrade targets against age threshold; block/skip too-new versions.
+
+    is_cask=True  → --cask was given (casks only)
+    is_cask=False → --formula was given (formulas only)
+    is_cask=None  → neither flag; check both (discovery mode only)
+    """
+    named = bool(formulae)
+
+    if not named:
+        # Discover what's outdated, then filter to safe subset.
+        formula_names = _get_outdated_names(False) if is_cask is not True else []
+        cask_names    = _get_outdated_names(True)  if is_cask is not False else []
+        targets: list[tuple[str, bool]] = (
+            [(n, False) for n in formula_names] + [(n, True) for n in cask_names]
+        )
+        if not targets:
+            # Nothing outdated — let brew print its normal message.
+            type_flags = (["--cask"] if is_cask is True else
+                          ["--formula"] if is_cask is False else [])
+            run_real_brew(["upgrade"] + type_flags + flags)
+            return
+    else:
+        # Named targets: auto-detection handles formula-vs-cask.
+        targets = [(n, is_cask if is_cask is not None else False) for n in formulae]
+
+    kind_label = "cask" if is_cask is True else "formula" if is_cask is False else "package"
+    print(f"\n[safe-brew] Checking {len(targets)} {kind_label}(s) — "
+          f"only versions >{SAFE_AGE_DAYS} days old allowed\n")
+
+    results: dict[tuple[str, bool], dict] = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(check_formula, n, c): (n, c) for n, c in targets}
+        for fut in as_completed(futures):
+            key = futures[fut]
+            results[key] = fut.result()
+
+    if named:
+        # Named mode: block if any target is not yet old enough.
+        # Unlike install, we cannot pin to a fallback — the current installed
+        # version IS the safe fallback, so blocking means "keep what you have".
+        blocked = False
+        for n, c in targets:
+            r = results[(n, c)]
+            if "error" in r or "rate_limited" in r:
+                _print_result(r)
+                blocked = True
+            elif "date_unknown" in r:
+                _print_result(r)  # warns but allows
+            elif not r.get("safe"):
+                fb = r.get("fallback")
+                fb_ver = fb[0] if fb else None
+                print(
+                    f"⛔  {r['name']}=={r.get('version','?')} "
+                    f"({r['pub_date']}, {r['age_days']}d old) — too new, upgrade blocked"
+                    + (f"\n     ℹ️   Current installed version is your safe fallback." if fb_ver else ""),
+                )
+                blocked = True
+            else:
+                _print_result(r)
+        if blocked:
+            print(
+                f"\n[safe-brew] ❌  Upgrade blocked — keeping installed version. "
+                f"Use --unsafe to bypass.\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cask_flags = ["--cask"] if is_cask is True else []
+        print(f"\n[safe-brew] Running: brew upgrade {' '.join(cask_flags + formulae + flags)}\n")
+        run_real_brew(["upgrade"] + cask_flags + formulae + flags)
+
+    else:
+        # Discovery mode: skip the too-new ones, upgrade only the safe ones.
+        safe_formulas: list[str] = []
+        safe_casks: list[str] = []
+        blocked_names: list[str] = []
+
+        for n, c in targets:
+            r = results[(n, c)]
+            if "error" in r or "rate_limited" in r:
+                _print_result(r)
+                blocked_names.append(n)
+            elif "date_unknown" in r:
+                _print_result(r)  # warns but allows
+                (safe_casks if c else safe_formulas).append(n)
+            elif not r.get("safe"):
+                print(
+                    f"⛔  {r['name']}=={r.get('version','?')} "
+                    f"({r['pub_date']}, {r['age_days']}d old) — too new, skipping"
+                )
+                blocked_names.append(n)
+            else:
+                _print_result(r)
+                (safe_casks if c else safe_formulas).append(n)
+
+        if blocked_names:
+            print(
+                f"\n[safe-brew] ⛔  Skipping {len(blocked_names)} package(s) too new to upgrade: "
+                f"{', '.join(blocked_names)}"
+            )
+
+        if not safe_formulas and not safe_casks:
+            print(f"\n[safe-brew] ℹ️   Nothing safe to upgrade right now.\n")
+            sys.exit(0)
+
+        print()
+        real = _find_real_brew()
+        env = {**os.environ, "SAFE_BREW_ACTIVE": "1"}
+        if safe_formulas and safe_casks:
+            # Two separate runs; use subprocess for the first so we can continue.
+            r1 = subprocess.run([real, "upgrade", "--formula"] + flags + safe_formulas, env=env)
+            r2 = subprocess.run([real, "upgrade", "--cask"] + flags + safe_casks, env=env)
+            sys.exit(r1.returncode or r2.returncode)
+        elif safe_formulas:
+            run_real_brew(["upgrade", "--formula"] + flags + safe_formulas)
+        else:
+            run_real_brew(["upgrade", "--cask"] + flags + safe_casks)
 
 
 # ─── Management subcommands ───────────────────────────────────────────────────
@@ -706,21 +997,50 @@ def main():
         run_real_brew([a for a in args if a != "--unsafe"])
         return
 
+    # --min-age N  (or --min-age=N): override age threshold for this invocation.
+    # Minimum allowed value is 2 days; stripped before passing args to real brew.
+    clean_args: list[str] = []
+    j = 0
+    while j < len(args):
+        tok = args[j]
+        val: str | None = None
+        if tok.startswith("--min-age="):
+            val = tok.split("=", 1)[1]
+        elif tok == "--min-age" and j + 1 < len(args):
+            val = args[j + 1]
+            j += 1  # skip the value token
+        else:
+            clean_args.append(tok)
+        if val is not None:
+            try:
+                days = int(val)
+            except ValueError:
+                print(f"[safe-brew] ❌  --min-age requires an integer, got: {val}", file=sys.stderr)
+                sys.exit(1)
+            if days < 2:
+                print(f"[safe-brew] ⚠️   --min-age minimum is 2; clamping {days} → 2")
+                days = 2
+            global SAFE_AGE_DAYS, CUTOFF
+            SAFE_AGE_DAYS = days
+            CUTOFF = datetime.now(timezone.utc) - timedelta(days=SAFE_AGE_DAYS)
+        j += 1
+    args = clean_args
+
     # Skip any leading global brew options (e.g. `brew --verbose install jq`)
-    # so we don't miss the install subcommand.
+    # so we don't miss the subcommand.
     i = 0
     while i < len(args) and args[i].startswith("-"):
         i += 1
-    if i >= len(args) or args[i] != "install":
+    if i >= len(args) or args[i] not in ("install", "upgrade"):
         run_real_brew(args)
         return
 
-    # Collect the global flags we skipped, plus everything after "install"
+    subcommand = args[i]
     global_flags = args[:i]
     rest = args[i + 1:]
 
-    # --HEAD bypasses the version-age model entirely — block it.
-    if "--HEAD" in rest:
+    # --HEAD bypasses the version-age model entirely — block it for install.
+    if subcommand == "install" and "--HEAD" in rest:
         print(
             "[safe-brew] ❌  --HEAD installs are not allowed: HEAD builds have no stable "
             "version date and bypass supply-chain age checks.\n"
@@ -729,7 +1049,20 @@ def main():
         )
         sys.exit(1)
 
-    is_cask = "--cask" in rest or "--casks" in rest
+    # Determine formula vs cask mode.
+    # For upgrade: --formula is also meaningful (restrict to formulas only).
+    has_cask_flag    = "--cask" in rest or "--casks" in rest
+    has_formula_flag = "--formula" in rest
+
+    if subcommand == "install":
+        is_cask_install: bool = has_cask_flag
+    else:
+        # upgrade: three-way: True=cask-only, False=formula-only, None=both
+        upgrade_is_cask: bool | None = (
+            True  if has_cask_flag and not has_formula_flag else
+            False if has_formula_flag and not has_cask_flag else
+            None
+        )
 
     # Flags that consume the next token as their value — those tokens must not
     # be treated as package names.
@@ -737,6 +1070,9 @@ def main():
         "--appdir", "--caskroom", "--language",  # cask install options that take a value
         "--cc",                                  # formula: compiler override (e.g. --cc gcc-14)
     }
+
+    # Tokens to strip from flags (we manage them ourselves).
+    _SKIP_FLAGS = {"--cask", "--casks", "--formula"}
 
     flags: list[str] = global_flags
     formulae: list[str] = []
@@ -747,15 +1083,17 @@ def main():
             flags.extend([tok, rest[j + 1]])
             j += 2
         elif tok.startswith("-"):
-            # --cask/--casks tracked via is_cask; don't add to flags (handle_install adds it)
-            if tok not in ("--cask", "--casks"):
+            if tok not in _SKIP_FLAGS:
                 flags.append(tok)
             j += 1
         else:
             formulae.append(tok)
             j += 1
 
-    handle_install(formulae, flags, is_cask)
+    if subcommand == "install":
+        handle_install(formulae, flags, is_cask_install)
+    else:
+        handle_upgrade(formulae, flags, upgrade_is_cask)
 
 
 if __name__ == "__main__":

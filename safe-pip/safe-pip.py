@@ -60,6 +60,17 @@ def release_date(files: list) -> datetime | None:
     return min(times) if times else None
 
 
+def is_version_safe(info: dict, ver_str: str) -> tuple[bool, str | None]:
+    """Return (safe, pub_date_str) for a specific version; safe=True if published before CUTOFF."""
+    files = info.get("releases", {}).get(ver_str, [])
+    if not files:
+        return True, None
+    pub = release_date(files)
+    if not pub:
+        return True, None
+    return pub < CUTOFF, pub.strftime("%Y-%m-%d")
+
+
 _CURRENT_PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
 
@@ -185,6 +196,17 @@ def count_safe(info: dict) -> tuple[int, int]:
 
 
 # ─── Real pip (avoids recursive wrapper calls) ────────────────────────────────
+
+def _is_local_install(arg: str) -> bool:
+    """Return True if arg is a local path, direct URL, or VCS URL — not a PyPI name."""
+    if arg.startswith(('.', '/', '~')):
+        return True
+    if arg.startswith(('http://', 'https://', 'file://', 'git+', 'hg+', 'svn+', 'bzr+')):
+        return True
+    if any(arg.endswith(ext) for ext in ('.whl', '.tar.gz', '.zip', '.tar.bz2', '.tgz')):
+        return True
+    return False
+
 
 def run_real_pip(args: list[str]) -> None:
     """Invoke the real pip via sys.executable -m pip (pyenv-safe, no wrapper recursion)."""
@@ -455,9 +477,65 @@ def check_package(name: str, specifier: str = "") -> dict:
         return {"name": name, "specifier": specifier, "safe_ver": None, "error": str(e)}
 
 
-def handle_install(pkg_args: list[str], flags: list[str], upgrade: bool) -> None:
-    if not pkg_args:
+def _check_local_deps(local_args: list[str], install_flags: list[str], flags: list[str]) -> None:
+    """Age-check all deps that pip would install from local/editable packages."""
+    plan = resolve_install_plan(local_args, install_flags + flags)
+    if not plan:
+        return
+
+    print(f"[safe-pip] Checking {len(plan)} dependenc{'y' if len(plan)==1 else 'ies'} "
+          f"from local package(s)...\n")
+
+    def _check_ver(name: str, ver: str) -> dict:
+        try:
+            info = fetch_pypi(name)
+            safe, pub_date = is_version_safe(info, ver)
+            return {"name": name, "ver": ver, "safe": safe, "pub_date": pub_date}
+        except Exception as e:
+            return {"name": name, "ver": ver, "error": str(e)}
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(_check_ver, name, ver): (name, ver) for name, ver in plan}
+        for fut in as_completed(futures):
+            name, ver = futures[fut]
+            results[(name, ver)] = fut.result()
+
+    blocked = False
+    for name, ver in plan:
+        r = results[(name, ver)]
+        if "error" in r:
+            print(f"✅  {name}=={ver} (not on PyPI — passing through)")
+        elif r["safe"]:
+            date_str = f" ({r['pub_date']})" if r.get("pub_date") else ""
+            print(f"✅  {name}=={ver}{date_str} — dep safe")
+        else:
+            print(f"❌  {name}=={ver}: published {r.get('pub_date', '?')} — too new (local dep)",
+                  file=sys.stderr)
+            blocked = True
+
+    if blocked:
+        print(
+            f"\n[safe-pip] ❌  Install blocked: local package dep(s) are too new.\n"
+            f"  Use --unsafe to bypass.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def handle_install(pkg_args: list[str], local_args: list[str], flags: list[str], upgrade: bool) -> None:
+    install_flags = ["--upgrade"] if upgrade else []
+
+    if not pkg_args and not local_args:
         run_real_pip(["install"] + flags)
+        return
+
+    if local_args:
+        _check_local_deps(local_args, install_flags, flags)
+
+    if not pkg_args:
+        print(f"\n[safe-pip] Running: pip install {' '.join(local_args + flags)}\n")
+        run_real_pip(["install"] + install_flags + local_args + flags)
         return
 
     print(f"\n[safe-pip] Checking {len(pkg_args)} package(s) — "
@@ -543,15 +621,14 @@ def handle_install(pkg_args: list[str], flags: list[str], upgrade: bool) -> None
         sys.exit(1)
 
     # ── Check transitive dependencies via pip dry-run ──────────────────────
-    install_flags = ["--upgrade"] if upgrade else []
     passthrough_args = [arg for _, _, arg in passthrough]
     all_pinned = pinned_args + passthrough_args
 
     top_level_names = {r["name"].lower() for r in results.values() if r.get("safe_ver")}
     all_pinned = _check_transitives(all_pinned, top_level_names, install_flags, flags)
 
-    print(f"\n[safe-pip] Running: pip install {' '.join(all_pinned + flags)}\n")
-    run_real_pip(["install"] + install_flags + all_pinned + flags)
+    print(f"\n[safe-pip] Running: pip install {' '.join(all_pinned + local_args + flags)}\n")
+    run_real_pip(["install"] + install_flags + all_pinned + local_args + flags)
 
 
 def _check_transitives(
@@ -843,6 +920,7 @@ def main():
     req_file = None
     skip_indices: set[int] = set()
     value_indices: set[int] = set()
+    editable_local: list[str] = []  # reconstructed -e/-editable tokens for local installs
 
     i = 0
     while i < len(rest):
@@ -852,8 +930,16 @@ def main():
             skip_indices |= {i, i + 1}
             i += 2
             continue
+        if a in ("-e", "--editable") and i + 1 < len(rest):
+            editable_local += [a, rest[i + 1]]
+            skip_indices |= {i, i + 1}
+            i += 2
+            continue
         if a.startswith("--requirement="):
             req_file = a.split("=", 1)[1]
+            skip_indices.add(i)
+        elif a.startswith("--editable="):
+            editable_local.append(a)
             skip_indices.add(i)
         elif a in _PIP_VALUE_FLAGS and i + 1 < len(rest):
             # Space-separated form: --index-url URL (not --index-url=URL)
@@ -865,6 +951,11 @@ def main():
              if i not in skip_indices and (a.startswith("-") or i in value_indices)]
     pkg_args = [a for i, a in enumerate(rest)
                 if i not in skip_indices and i not in value_indices and not a.startswith("-")]
+
+    # Separate local paths/URLs from PyPI names; combine with editable installs
+    local_pkg_args = [a for a in pkg_args if _is_local_install(a)]
+    pkg_args       = [a for a in pkg_args if not _is_local_install(a)]
+    local_args     = editable_local + local_pkg_args
 
     # Alternate indexes can't be audited — safe-pip only checks pypi.org.
     # Flags that change the package source or install location can't be safely audited:
@@ -893,8 +984,8 @@ def main():
     if req_file:
         other_flags = [f for f in flags if f not in ("-r", "--requirement")]
         handle_requirements(req_file, other_flags, upgrade)
-    elif pkg_args:
-        handle_install(pkg_args, flags, upgrade)
+    elif pkg_args or local_args:
+        handle_install(pkg_args, local_args, flags, upgrade)
     else:
         run_real_pip(args)
 
