@@ -47,6 +47,26 @@ def _github_get(url: str) -> list | dict | None:
         with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
+        if e.code == 401:
+            if GITHUB_TOKEN:
+                raise GitHubAPIError(
+                    "GitHub API returned 401 Unauthorized — your GITHUB_TOKEN appears to be "
+                    "expired or revoked.\n"
+                    "  Generate a new token at: https://github.com/settings/tokens\n"
+                    "  Then set it in your shell config:\n"
+                    "    export GITHUB_TOKEN=<new-token>   # bash/zsh\n"
+                    "    set -x GITHUB_TOKEN <new-token>   # fish\n"
+                    "  Or use --unsafe to bypass the age check for this install."
+                )
+            else:
+                raise GitHubAPIError(
+                    "GitHub API returned 401 Unauthorized.\n"
+                    "  Set a GitHub token to authenticate:\n"
+                    "    Generate one at: https://github.com/settings/tokens\n"
+                    "    export GITHUB_TOKEN=<token>   # bash/zsh\n"
+                    "    set -x GITHUB_TOKEN <token>   # fish\n"
+                    "  Or use --unsafe to bypass the age check for this install."
+                )
         if e.code in (403, 429):
             raise RateLimitError(
                 "GitHub API rate limit hit. Set GITHUB_TOKEN env var for higher limits "

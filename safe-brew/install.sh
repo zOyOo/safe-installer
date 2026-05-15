@@ -128,6 +128,74 @@ else
   echo ""
 fi
 
-echo "  Optional: set GITHUB_TOKEN in your environment for higher GitHub API rate limits"
-echo "  (unauthenticated: 60 req/hr, authenticated: 5000 req/hr)."
+# ─── GitHub token setup ───────────────────────────────────────────────────────
+
+echo ""
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  info "GITHUB_TOKEN is already set in your environment — skipping token setup."
+else
+  echo "  safe-brew uses the GitHub API to check formula commit history."
+  echo "  Without a token you get 60 requests/hour (often enough for casual use)."
+  echo "  With a token you get 5000 requests/hour."
+  echo ""
+  echo "  Generate a token (no scopes needed for public repos):"
+  echo "  https://github.com/settings/tokens/new"
+  echo ""
+  printf "  Enter your GitHub token (or press Enter to skip): "
+  read -r INPUT_TOKEN
+
+  if [[ -z "$INPUT_TOKEN" ]]; then
+    warn "Skipped. You can set GITHUB_TOKEN later and re-run install.sh."
+  else
+    # Validate the token against the GitHub API
+    printf "  Validating token... "
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: token $INPUT_TOKEN" \
+      -H "User-Agent: safe-brew-installer" \
+      https://api.github.com/user)
+
+    if [[ "$HTTP_CODE" == "200" ]]; then
+      echo "OK"
+
+      # Write to shell configs that exist
+      TOKEN_LINE="export GITHUB_TOKEN=\"$INPUT_TOKEN\""
+      WROTE_ANY=false
+
+      for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+        if [[ -f "$rc" ]]; then
+          if grep -q 'GITHUB_TOKEN' "$rc" 2>/dev/null; then
+            warn "$rc already contains GITHUB_TOKEN — skipping (update it manually if needed)."
+          else
+            printf '\n# Added by safe-brew installer\n%s\n' "$TOKEN_LINE" >> "$rc"
+            info "Written to $rc"
+            WROTE_ANY=true
+          fi
+        fi
+      done
+
+      # fish: use universal variables (persists across sessions without editing files)
+      if command -v fish &>/dev/null; then
+        fish -c "set -Ux GITHUB_TOKEN '$INPUT_TOKEN'" 2>/dev/null \
+          && { info "Set as fish universal variable (GITHUB_TOKEN)"; WROTE_ANY=true; } \
+          || warn "Could not set fish universal variable — set it manually."
+      fi
+
+      if [[ "$WROTE_ANY" == "false" ]]; then
+        warn "No shell config files found. Add this line manually:"
+        echo ""
+        echo "    $TOKEN_LINE"
+      fi
+
+      info "GitHub token configured. Reload your shell or run: source ~/.bashrc"
+    elif [[ "$HTTP_CODE" == "401" ]]; then
+      echo "FAILED"
+      warn "Token is invalid or expired (HTTP 401). Not saved."
+      warn "Generate a new one at: https://github.com/settings/tokens"
+    else
+      echo "FAILED (HTTP $HTTP_CODE)"
+      warn "Could not validate token. Check your network connection."
+      warn "You can set GITHUB_TOKEN manually after installation."
+    fi
+  fi
+fi
 echo ""

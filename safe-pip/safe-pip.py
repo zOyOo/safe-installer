@@ -16,6 +16,7 @@ import tempfile
 
 SAFE_AGE_DAYS = int(os.environ.get('SAFE_PIP_AGE_DAYS', '30'))
 CUTOFF = datetime.now(timezone.utc) - timedelta(days=SAFE_AGE_DAYS)
+MIN_AGE_DAYS = 2
 
 try:
     from packaging.version import Version, InvalidVersion
@@ -937,11 +938,44 @@ def _cmd_status():
     disabled = os.path.exists(DISABLED_FLAG)
     state = "🔴 DISABLED" if disabled else "🟢 ENABLED"
     print(f"[safe-pip] Status: {state}")
-    print(f"           Age threshold: {SAFE_AGE_DAYS} days (SAFE_PIP_AGE_DAYS)")
+    age_source = "SAFE_PIP_AGE_DAYS env var" if os.environ.get("SAFE_PIP_AGE_DAYS") else "default"
+    print(f"           Age threshold: {SAFE_AGE_DAYS} days ({age_source}; override with --min-age, min {MIN_AGE_DAYS})")
+
+
+def apply_min_age_flag(args: list[str]) -> list[str]:
+    """Strip --min-age=N / --min-age N from args and update SAFE_AGE_DAYS/CUTOFF globals."""
+    global SAFE_AGE_DAYS, CUTOFF
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--min-age="):
+            val = a[len("--min-age="):]
+        elif a == "--min-age" and i + 1 < len(args):
+            i += 1
+            val = args[i]
+        else:
+            out.append(a)
+            i += 1
+            continue
+        try:
+            days = int(val)
+        except ValueError:
+            print(f"[safe-pip] ❌  --min-age requires an integer, got: {val}", file=sys.stderr)
+            sys.exit(1)
+        if days < MIN_AGE_DAYS:
+            print(f"[safe-pip] ❌  --min-age must be >= {MIN_AGE_DAYS} (got: {days})", file=sys.stderr)
+            sys.exit(1)
+        SAFE_AGE_DAYS = days
+        CUTOFF = datetime.now(timezone.utc) - timedelta(days=days)
+        i += 1
+    return out
 
 
 def main():
     args = sys.argv[1:]
+
+    args = apply_min_age_flag(args)
 
     # Built-in management subcommands (intercept before passing to pip)
     if args and args[0] == "disable":
