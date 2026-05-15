@@ -9,3 +9,7 @@ safe-pip/__pycache__/
 
 # macOS
 .DS_Store
+
+# Claude local settings
+**/.claude/
+safe-pip/pypi-publishing-plan.md
