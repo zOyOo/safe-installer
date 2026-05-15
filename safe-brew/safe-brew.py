@@ -525,6 +525,20 @@ def _install_casks_via_tap(
 
 # ─── Formula file downloader (path-layout aware) ─────────────────────────────
 
+# Directives that are only valid inside official Homebrew taps and cause errors
+# when used in a third-party local tap.
+_OFFICIAL_TAP_ONLY_DIRECTIVES = re.compile(
+    r"^\s*no_autobump!.*$", re.MULTILINE
+)
+
+
+def _sanitize_formula(content: bytes) -> bytes:
+    """Strip official-tap-only directives from a downloaded formula."""
+    text = content.decode("utf-8", errors="replace")
+    text = _OFFICIAL_TAP_ONLY_DIRECTIVES.sub("", text)
+    return text.encode("utf-8")
+
+
 def _fetch_raw_formula(url: str, name: str) -> bytes:
     """Download a formula .rb file, retrying with the alternate path layout on 404.
 
@@ -551,7 +565,7 @@ def _fetch_raw_formula(url: str, name: str) -> bytes:
         try:
             req = urllib.request.Request(candidate, headers={"User-Agent": "safe-brew/1.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
-                return r.read()
+                return _sanitize_formula(r.read())
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 last_err = e
