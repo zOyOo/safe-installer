@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # safe-pip installer
 # Usage:
-#   bash install.sh               # install safe-pip command only
-#   bash install.sh --pip-wrapper # also replace pip / pip3 commands
+#   bash install.sh                  # install safe-pip and wrap pip/pip3 (default)
+#   bash install.sh --no-pip-wrapper # install safe-pip only, leave pip/pip3 untouched
 set -euo pipefail
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -10,11 +10,11 @@ info()  { echo -e "${GREEN}[safe-pip]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[safe-pip]${NC} $*"; }
 error() { echo -e "${RED}[safe-pip]${NC} $*" >&2; exit 1; }
 
-WRAP_PIP=false
+WRAP_PIP=true
 VENV_HOOK=false
 for arg in "$@"; do
-  [[ "$arg" == "--pip-wrapper" ]] && WRAP_PIP=true
-  [[ "$arg" == "--venv-hook"   ]] && VENV_HOOK=true
+  [[ "$arg" == "--no-pip-wrapper" ]] && WRAP_PIP=false
+  [[ "$arg" == "--venv-hook"      ]] && VENV_HOOK=true
 done
 
 # ─── Prerequisites ────────────────────────────────────────────────────────────
@@ -228,7 +228,7 @@ if [[ "$WRAP_PIP" == "true" ]]; then
   echo "  Note: safe-pip internally uses 'python -m pip' to call the real pip,"
   echo "  so it works correctly with pyenv — no recursion, no version confusion."
 else
-  echo "  To also replace pip / pip3, re-run with: bash install.sh --pip-wrapper"
+  echo "  To install without wrapping pip / pip3, re-run with: bash install.sh --no-pip-wrapper"
   echo ""
 fi
 

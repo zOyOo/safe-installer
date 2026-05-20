@@ -33,11 +33,11 @@ All three tools also perform **recursive transitive dependency checking**: if A 
 ```bash
 cd safe-npm
 
-# Install safe-npm and safe-npx commands only
+# Install safe-npm and wrap npm/npx (default)
 bash install.sh
 
-# Also replace npm and npx with wrappers (recommended)
-bash install.sh --npm-wrapper
+# Install safe-npm only, leave npm/npx untouched
+bash install.sh --no-npm-wrapper
 ```
 
 Requires Node.js ≥ 16 and npm.
@@ -48,13 +48,13 @@ Binaries are placed in `~/.local/bin/`.
 ### Usage
 
 ```bash
-# Use directly
-safe-npm install express
-safe-npx create-react-app my-app
-
-# Or transparently via wrappers (if --npm-wrapper was used)
+# Transparently via wrappers (default)
 npm install express
 npx create-react-app my-app
+
+# Or invoke directly
+safe-npm install express
+safe-npx create-react-app my-app
 ```
 
 When a package or any of its dependencies is too new, the install is blocked:
@@ -110,14 +110,14 @@ bash safe-npm/uninstall.sh
 ```bash
 cd safe-pip
 
-# Install safe-pip command only
+# Install safe-pip and wrap pip/pip3 (default)
 bash install.sh
 
-# Also replace pip and pip3 (recommended)
-bash install.sh --pip-wrapper
+# Install safe-pip only, leave pip/pip3 untouched
+bash install.sh --no-pip-wrapper
 
 # Also protect pip inside virtual environments
-bash install.sh --pip-wrapper --venv-hook
+bash install.sh --venv-hook
 ```
 
 Requires Python ≥ 3.9 and pip.
@@ -130,12 +130,12 @@ Automatically registers a **pyenv hook** if pyenv is installed — new Python ve
 ### Usage
 
 ```bash
-# Use directly
-safe-pip install requests
-
-# Or transparently via wrappers (if --pip-wrapper was used)
+# Transparently via wrappers (default)
 pip install requests
 pip3 install flask
+
+# Or invoke directly
+safe-pip install requests
 ```
 
 When a package is too new:
@@ -193,29 +193,29 @@ bash safe-pip/uninstall.sh
 ```bash
 cd safe-brew
 
-# Install safe-brew command only
+# Install safe-brew and wrap brew (default)
 bash install.sh
 
-# Also replace the brew command (recommended)
-bash install.sh --brew-wrapper
+# Install safe-brew only, leave brew untouched
+bash install.sh --no-brew-wrapper
 ```
 
 Requires Python ≥ 3.9 and Homebrew.
 
 Installs to `~/.safe-brew/`. Binaries are placed in `~/.local/bin/`.
 
-> **Note for `--brew-wrapper`:** `~/.local/bin` must appear before `/opt/homebrew/bin` (Apple Silicon) or `/usr/local/bin` (Intel) in your `PATH` for the wrapper to shadow the real `brew`.
+> **Note:** `~/.local/bin` must appear before `/opt/homebrew/bin` (Apple Silicon) or `/usr/local/bin` (Intel) in your `PATH` for the wrapper to shadow the real `brew`.
 
 ### Usage
 
 ```bash
-# Use directly
-safe-brew install ripgrep
-safe-brew upgrade
-
-# Or transparently via wrapper (if --brew-wrapper was used)
+# Transparently via wrapper (default)
 brew install ripgrep
 brew upgrade
+
+# Or invoke directly
+safe-brew install ripgrep
+safe-brew upgrade
 ```
 
 safe-brew checks the last commit date of each formula's `.rb` file in the Homebrew GitHub repository. When a formula was updated too recently, it either blocks or installs the last safe version:

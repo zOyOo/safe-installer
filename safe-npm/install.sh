@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # safe-npm installer
 # Usage:
-#   bash install.sh
-#   bash install.sh --npm-wrapper   # also replace `npm` with safe-npm
+#   bash install.sh                  # install safe-npm and wrap npm/npx (default)
+#   bash install.sh --no-npm-wrapper # install safe-npm only, leave npm/npx untouched
 set -euo pipefail
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
@@ -12,8 +12,8 @@ info()  { echo -e "${GREEN}[safe-npm]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[safe-npm]${NC} $*"; }
 error() { echo -e "${RED}[safe-npm]${NC} $*" >&2; exit 1; }
 
-WRAP_NPM=false
-for arg in "$@"; do [[ "$arg" == "--npm-wrapper" ]] && WRAP_NPM=true; done
+WRAP_NPM=true
+for arg in "$@"; do [[ "$arg" == "--no-npm-wrapper" ]] && WRAP_NPM=false; done
 
 # ─── Prerequisites ────────────────────────────────────────────────────────────
 
@@ -131,6 +131,6 @@ if [[ "$WRAP_NPM" == "true" ]]; then
   info "npm is now aliased to safe-npm."
   info "The real npm is: $REAL_NPM"
 else
-  echo "  To also replace 'npm', re-run with: bash install.sh --npm-wrapper"
+  echo "  To install without wrapping npm, re-run with: bash install.sh --no-npm-wrapper"
   echo ""
 fi

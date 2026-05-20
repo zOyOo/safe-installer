@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # safe-brew installer
 # Usage:
-#   bash install.sh                # install safe-brew command only
-#   bash install.sh --brew-wrapper # also replace the `brew` command
+#   bash install.sh                   # install safe-brew and wrap brew (default)
+#   bash install.sh --no-brew-wrapper # install safe-brew only, leave brew untouched
 set -euo pipefail
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -10,8 +10,8 @@ info()  { echo -e "${GREEN}[safe-brew]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[safe-brew]${NC} $*"; }
 error() { echo -e "${RED}[safe-brew]${NC} $*" >&2; exit 1; }
 
-WRAP_BREW=false
-for arg in "$@"; do [[ "$arg" == "--brew-wrapper" ]] && WRAP_BREW=true; done
+WRAP_BREW=true
+for arg in "$@"; do [[ "$arg" == "--no-brew-wrapper" ]] && WRAP_BREW=false; done
 
 # ─── Prerequisites ────────────────────────────────────────────────────────────
 
@@ -124,7 +124,7 @@ if [[ "$WRAP_BREW" == "true" ]]; then
   echo "  Note: safe-brew calls the real brew directly via SAFE_BREW_REAL,"
   echo "  so there is no recursion even when brew → safe-brew."
 else
-  echo "  To also replace 'brew', re-run with: bash install.sh --brew-wrapper"
+  echo "  To install without wrapping brew, re-run with: bash install.sh --no-brew-wrapper"
   echo ""
 fi
 
